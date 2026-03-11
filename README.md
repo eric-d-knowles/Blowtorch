@@ -2,7 +2,7 @@
 
 A macOS menu bar app for connecting to the [NYU Torch HPC cluster](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/torch). It handles authentication, job submission, tunnel setup, and IDE launch — all from a single window.
 
-![Torch Dev icon](icon.png)
+![Torch Dev icon](AppIcon.appiconset)
 
 ---
 
