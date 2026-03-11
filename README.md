@@ -73,7 +73,7 @@ If authentication is required, the app will display your device code PIN and ope
 
 ```bash
 git clone https://github.com/eric-d-knowles/TorchDev.git
-cd torch-dev
+cd TorchDev
 open TorchDev.xcodeproj
 ```
 
