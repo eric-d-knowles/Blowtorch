@@ -1077,6 +1077,13 @@ struct SSHTroubleshootView: View {
     @State private var log: String = ""
     @State private var showLog = false
     
+    // Auth UI state (for key upload)
+    @State private var authRequired = false
+    @State private var authPIN: String = ""
+    @State private var authURL: String = "https://login.microsoft.com/device"
+    @State private var pendingFixAfterAuth: String? = nil
+    @State private var inputPipe: Pipe? = nil
+    
     var body: some View {
         VStack(spacing: 16) {
             // Header
@@ -1099,6 +1106,75 @@ struct SSHTroubleshootView: View {
                             runFix(for: check)
                         })
                     }
+                }
+            }
+            
+            // Auth card (shown when key upload needs SSH auth)
+            if authRequired {
+                GroupBox {
+                    VStack(spacing: 12) {
+                        Image(systemName: "person.badge.key.fill")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.blue)
+                        
+                        Text("Sign in Required")
+                            .font(.headline)
+                        
+                        if !authPIN.isEmpty {
+                            VStack(spacing: 4) {
+                                Text("Enter this code:")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                
+                                HStack(spacing: 8) {
+                                    Text(authPIN)
+                                        .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                        .textSelection(.enabled)
+                                    
+                                    Button(action: {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(authPIN, forType: .string)
+                                    }) {
+                                        Image(systemName: "doc.on.doc")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Copy to clipboard")
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        
+                        Button(action: {
+                            if let url = URL(string: authURL) {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }) {
+                            HStack {
+                                Image(systemName: "safari")
+                                Text("Open Browser")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                        
+                        Button(action: continueAfterAuth) {
+                            HStack {
+                                Image(systemName: "arrow.right.circle.fill")
+                                Text("Continue")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        
+                        Text("Complete sign-in in browser, then click Continue.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(8)
                 }
             }
             
@@ -1249,9 +1325,8 @@ struct SSHTroubleshootView: View {
             case "key":
                 // Generate SSH key
                 appendLog("\n→ Generating SSH key...")
-                let result = runCommandInteractive("/usr/bin/ssh-keygen", args: ["-t", "ed25519", "-f", 
-                    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519").path,
-                    "-N", ""]) // Empty passphrase for simplicity
+                let keyPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519").path
+                let result = runCommand("/usr/bin/ssh-keygen", args: ["-t", "ed25519", "-f", keyPath, "-N", ""])
                 DispatchQueue.main.async {
                     if result.success {
                         updateCheck("key", status: .ok, description: "Key generated successfully")
@@ -1274,27 +1349,21 @@ struct SSHTroubleshootView: View {
                 }
                 
             case "key_on_server":
-                // Upload key to server
-                appendLog("\n→ Uploading key to server (you may need to enter your password)...")
-                // This needs to be interactive - open Terminal
-                let script = """
-                    echo "Uploading SSH key to Torch..."
-                    ssh-copy-id -i ~/.ssh/id_ed25519 torch
-                    echo ""
-                    echo "Done! You can close this window."
-                    read -p "Press Enter to close..."
-                """
-                let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("upload_key.sh")
-                try? script.write(to: tempScript, atomically: true, encoding: .utf8)
+                // Upload key: first check if SSH is connected
+                appendLog("\n→ Checking SSH connection...")
+                let authCheck = runCommand("/usr/bin/ssh", args: ["-O", "check", "torch"])
                 
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", "tell application \"Terminal\" to activate", "-e", "tell application \"Terminal\" to do script \"bash '\(tempScript.path)'\""]
-                try? process.run()
-                
-                DispatchQueue.main.async {
-                    updateCheck("key_on_server", status: .checking, description: "Complete in Terminal window, then re-check")
-                    appendLog("→ Complete key upload in Terminal window")
+                if authCheck.success {
+                    // Already connected — upload key directly
+                    uploadKeyToServer()
+                } else {
+                    // Need to authenticate first — run ssh -fNM via PTY to get the PIN
+                    appendLog("→ SSH not connected, starting authentication...")
+                    DispatchQueue.main.async {
+                        pendingFixAfterAuth = "key_on_server"
+                        updateCheck("key_on_server", status: .fixing, description: "Authenticating...")
+                    }
+                    startSSHAuth()
                 }
                 
             case "agent":
@@ -1305,7 +1374,6 @@ struct SSHTroubleshootView: View {
                 let sshConfigPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/config")
                 var config = (try? String(contentsOf: sshConfigPath, encoding: .utf8)) ?? ""
                 
-                // Check if we need to add the Host * block
                 if !config.contains("AddKeysToAgent") {
                     let agentConfig = """
                     
@@ -1319,33 +1387,16 @@ struct SSHTroubleshootView: View {
                     appendLog("→ Added keychain settings to SSH config")
                 }
                 
-                // Add to agent
-                let result = runCommand("/usr/bin/ssh-add", args: ["--apple-use-keychain", 
-                    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519").path])
+                let keyPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519").path
+                let result = runCommand("/usr/bin/ssh-add", args: ["--apple-use-keychain", keyPath])
                 
                 DispatchQueue.main.async {
                     if result.success || result.output.contains("Identity added") {
                         updateCheck("agent", status: .ok, description: "Key added to agent with keychain")
                         appendLog("✓ Key added to agent")
                     } else {
-                        // May need passphrase - open Terminal
-                        let script = """
-                            echo "Adding SSH key to agent..."
-                            ssh-add --apple-use-keychain ~/.ssh/id_ed25519
-                            echo ""
-                            echo "Done! You can close this window."
-                            read -p "Press Enter to close..."
-                        """
-                        let tempScript = FileManager.default.temporaryDirectory.appendingPathComponent("add_agent.sh")
-                        try? script.write(to: tempScript, atomically: true, encoding: .utf8)
-                        
-                        let process = Process()
-                        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                        process.arguments = ["-e", "tell application \"Terminal\" to activate", "-e", "tell application \"Terminal\" to do script \"bash '\(tempScript.path)'\""]
-                        try? process.run()
-                        
-                        updateCheck("agent", status: .checking, description: "Enter passphrase in Terminal, then re-check")
-                        appendLog("→ Enter passphrase in Terminal window")
+                        updateCheck("agent", status: .needsFix, description: "Key may have a passphrase — run 'ssh-add' in a terminal")
+                        appendLog("✗ Could not add key automatically: \(result.output)")
                     }
                 }
                 
@@ -1353,6 +1404,113 @@ struct SSHTroubleshootView: View {
                 break
             }
         }
+    }
+    
+    private func uploadKeyToServer() {
+        let keyPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519.pub").path
+        
+        guard let pubKey = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else {
+            DispatchQueue.main.async {
+                updateCheck("key_on_server", status: .needsFix, description: "Could not read public key")
+                appendLog("✗ Could not read \(keyPath)")
+            }
+            return
+        }
+        
+        appendLog("→ Uploading key to server...")
+        let installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '\(pubKey)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo 'KEY_INSTALLED'"
+        let installResult = runCommand("/usr/bin/ssh", args: ["torch", installCmd])
+        
+        DispatchQueue.main.async {
+            if installResult.output.contains("KEY_INSTALLED") {
+                updateCheck("key_on_server", status: .ok, description: "Key uploaded to server")
+                appendLog("✓ Key installed on torch")
+            } else {
+                updateCheck("key_on_server", status: .needsFix, description: "Failed to upload key")
+                appendLog("✗ Failed: \(installResult.output)")
+            }
+        }
+    }
+    
+    private func startSSHAuth() {
+        // Run ssh -fNM torch via PTY using 'script' to capture the auth PIN output
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        process.arguments = ["-q", "/dev/null", "/usr/bin/ssh", "-fNM", "torch"]
+        
+        let outputPipe = Pipe()
+        let input = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        process.standardInput = input
+        
+        DispatchQueue.main.async {
+            inputPipe = input
+        }
+        
+        outputPipe.fileHandleForReading.readabilityHandler = { [self] handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                DispatchQueue.main.async {
+                    // Look for auth PIN
+                    if output.contains("Authenticate with PIN") || output.contains("NEEDS_AUTH") {
+                        authRequired = true
+                        
+                        if let pinMatch = output.range(of: "PIN\\s+([A-Z0-9]+)", options: .regularExpression) {
+                            let pinSubstring = output[pinMatch]
+                            authPIN = pinSubstring.replacingOccurrences(of: "PIN ", with: "").trimmingCharacters(in: .whitespaces)
+                        }
+                        
+                        if let urlMatch = output.range(of: "https://[^\\s]+", options: .regularExpression) {
+                            authURL = String(output[urlMatch])
+                        }
+                    }
+                }
+            }
+        }
+        
+        process.terminationHandler = { [self] proc in
+            DispatchQueue.main.async {
+                authRequired = false
+                authPIN = ""
+                outputPipe.fileHandleForReading.readabilityHandler = nil
+                
+                // Check if auth succeeded
+                let check = runCommand("/usr/bin/ssh", args: ["-O", "check", "torch"])
+                if check.success {
+                    appendLog("✓ Authenticated successfully")
+                    // Now run the pending fix
+                    if pendingFixAfterAuth == "key_on_server" {
+                        pendingFixAfterAuth = nil
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            uploadKeyToServer()
+                        }
+                    }
+                } else {
+                    updateCheck(pendingFixAfterAuth ?? "key_on_server", status: .needsFix, description: "Authentication failed — try again")
+                    appendLog("✗ Authentication failed")
+                    pendingFixAfterAuth = nil
+                }
+            }
+        }
+        
+        do {
+            try process.run()
+        } catch {
+            DispatchQueue.main.async {
+                updateCheck("key_on_server", status: .needsFix, description: "Failed to start SSH")
+                appendLog("✗ Failed to start SSH: \(error)")
+            }
+        }
+    }
+    
+    private func continueAfterAuth() {
+        // Send Enter to the ssh process to proceed after browser auth
+        if let data = "\n".data(using: .utf8) {
+            inputPipe?.fileHandleForWriting.write(data)
+        }
+        authRequired = false
+        authPIN = ""
     }
     
     private func updateCheck(_ id: String, status: SSHCheckStatus, description: String? = nil) {
@@ -1392,27 +1550,7 @@ struct SSHTroubleshootView: View {
         }
     }
     
-    private func runCommandInteractive(_ path: String, args: [String]) -> (success: Bool, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        
-        do {
-            try process.run()
-            process.waitUntilExit()
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            return (process.terminationStatus == 0, output)
-        } catch {
-            return (false, error.localizedDescription)
-        }
-    }
+
 }
 
 // MARK: - SSH Check Model
