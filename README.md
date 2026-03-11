@@ -12,12 +12,6 @@ A native macOS app for connecting to NYU's Torch HPC cluster.
 
 On first launch, macOS will ask for permission to control Terminal. Click **OK** to allow the app to open Terminal and run the connection script.
 
-## Adding an App Icon
-
-1. Create a 1024×1024 PNG image for your icon
-2. Use an online tool like [App Icon Generator](https://www.appicon.co/) to generate all sizes
-3. Drag the generated images into `Assets.xcassets/AppIcon.appiconset` in Xcode
-
 ## Distribution
 
 ### For Personal Use
