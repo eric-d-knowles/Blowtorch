@@ -49,14 +49,16 @@ Download the latest release from the [Releases](../../releases) page, unzip, and
 |---|---|
 | **Account** | Your Slurm account (e.g. `torch_pr_217_general`) |
 | **Hours** | Requested job duration (1–24) |
-| **CPUs** | Number of CPU cores |
-| **RAM (GB)** | Memory in gigabytes |
+| **CPUs** | Number of CPU cores (1–100) |
+| **RAM (GB)** | Memory in gigabytes (4–500, in steps of 4) |
 | **GPU** | Request a GPU node |
 | **Partition** | Slurm partition (leave blank for default) |
 | **Project** | Root directory to open in the IDE |
 | **IDE** | VS Code or Positron |
 
-Click **Connect** to start. The progress window shows each step:
+All settings are saved automatically between sessions.
+
+Click **Connect** to start. The progress window shows each step in real time, with a live log output you can expand for details:
 
 1. Authenticating with Microsoft
 2. Submitting the Slurm job
@@ -65,7 +67,7 @@ Click **Connect** to start. The progress window shows each step:
 5. Connecting to the node
 6. Launching the IDE
 
-If authentication is required, the app will display your device code PIN and open the browser for you.
+If authentication is required, the app will display your device code PIN and open the browser for you. While waiting for a node to be allocated, a **Check Queue Status** button appears showing your job's position, priority, and estimated start time.
 
 ---
 
@@ -83,14 +85,7 @@ Build and run with Xcode (⌘R). The bundled `torch-dev.sh` shell script must be
 
 ## Troubleshooting
 
-Use the built-in **Troubleshoot SSH** tool (in the Setup section) to diagnose connection issues. It checks for:
-
-- SSH key presence (`~/.ssh/id_ed25519`)
-- Stale `known_hosts` entries
-- Whether your key is authorized on the server
-- Whether the key is loaded in your SSH agent
-
-Each issue has a **Fix** button that attempts an automatic repair, or opens Terminal for steps that require interaction.
+Use the built-in **Troubleshoot SSH** tool (in the Setup section) to diagnose and auto-fix common connection issues. Each problem found has a **Fix** button that attempts an automatic repair, or opens Terminal for steps that require interaction.
 
 ---
 
