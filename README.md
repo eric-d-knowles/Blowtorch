@@ -1,62 +1,99 @@
 # Torch Dev
 
-A native macOS app for connecting to NYU's Torch HPC cluster.
+A macOS menu bar app for connecting to the [NYU Torch HPC cluster](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/torch). It handles authentication, job submission, tunnel setup, and IDE launch — all from a single window.
 
-## Building
+![Torch Dev icon](icon.png)
 
-1. Open `TorchDev.xcodeproj` in Xcode
-2. Select **Product → Build** (⌘B)
-3. To create a release build: **Product → Archive**
+---
 
-## First Run
+## Features
 
-On first launch, macOS will ask for permission to control Terminal. Click **OK** to allow the app to open Terminal and run the connection script.
+- **One-click connection** — submits a Slurm job, waits for allocation, sets up an SSH tunnel, and launches VS Code or Positron automatically
+- **Microsoft device auth** — detects when authentication is required and displays your PIN with a one-click browser button
+- **Queue status** — check your position and job details while waiting for a node
+- **SSH configuration** — built-in setup wizard for your `~/.ssh/config` torch host entry
+- **SSH troubleshooter** — diagnoses and auto-fixes common issues (missing keys, stale known_hosts, agent problems)
+- **Remote server setup** — creates `/scratch` symlinks for VS Code and Positron server installs to avoid home directory quota issues
 
-## Distribution
+---
 
-### For Personal Use
-After building, find `TorchDev.app` in Xcode's Products folder (right-click → Show in Finder) and copy it to `/Applications`.
+## Requirements
 
-### For Others (No Apple Developer Account)
-1. Build the app
-2. Zip it: `zip -r TorchDev.zip TorchDev.app`
-3. Share the zip file
+- macOS 13 or later
+- SSH access to the NYU Torch cluster (`torch.hpc.nyu.edu`)
+- NYU NetID and HPC account
+- [VS Code](https://code.visualstudio.com) or [Positron](https://github.com/posit-dev/positron) with the Remote SSH extension installed locally
 
-Users will need to:
-- Right-click → Open (first time only, to bypass Gatekeeper)
-- Or: System Settings → Privacy & Security → "Open Anyway"
+---
 
-### For Others (With Apple Developer Account)
-1. In Xcode, go to **Product → Archive**
-2. Click **Distribute App**
-3. Choose **Developer ID** for direct distribution
-4. This will notarize the app so users don't see Gatekeeper warnings
+## Installation
 
-## Prerequisites for Users
+Download the latest release from the [Releases](../../releases) page, unzip, and move `TorchDev.app` to your Applications folder.
 
-The app assumes users have:
+> **Note:** Because this app is not yet notarized, macOS may show a security warning on first launch. To open it, right-click the app and choose **Open**, then click **Open Anyway**. You only need to do this once.
 
-1. **SSH config** – An entry for `Host torch` in `~/.ssh/config`
-2. **SSH key** – `~/.ssh/id_ed25519` registered with the cluster  
-3. **VS Code or Positron** – With CLI tools installed (`code` or `positron` command)
+---
 
-## Project Structure
+## First-Time Setup
 
+1. Launch the app — it will prompt you to configure SSH if not already set up
+2. Enter your NYU NetID in the SSH Configuration sheet
+3. The app writes the required `Host torch` block to your `~/.ssh/config`
+4. Make sure your SSH key is authorized on the cluster (use the **Troubleshoot SSH** option if needed)
+
+---
+
+## Usage
+
+| Setting | Description |
+|---|---|
+| **Account** | Your Slurm account (e.g. `torch_pr_217_general`) |
+| **Hours** | Requested job duration (1–24) |
+| **CPUs** | Number of CPU cores |
+| **RAM (GB)** | Memory in gigabytes |
+| **GPU** | Request a GPU node |
+| **Partition** | Slurm partition (leave blank for default) |
+| **Project** | Root directory to open in the IDE |
+| **IDE** | VS Code or Positron |
+
+Click **Connect** to start. The progress window shows each step:
+
+1. Authenticating with Microsoft
+2. Submitting the Slurm job
+3. Waiting for a compute node
+4. Starting the SSH tunnel
+5. Connecting to the node
+6. Launching the IDE
+
+If authentication is required, the app will display your device code PIN and open the browser for you.
+
+---
+
+## Building from Source
+
+```bash
+git clone https://github.com/eric-d-knowles/TorchDev.git
+cd torch-dev
+open TorchDev.xcodeproj
 ```
-TorchDev/
-├── TorchDev.xcodeproj/
-├── TorchDev/
-│   ├── TorchDevApp.swift      # App entry point
-│   ├── ContentView.swift       # Main UI with settings form
-│   ├── TorchDev.entitlements   # Permissions for Terminal control
-│   ├── Resources/
-│   │   └── torch-dev.sh        # The connection script
-│   └── Assets.xcassets/        # App icon and colors
-└── README.md
-```
 
-## Customization
+Build and run with Xcode (⌘R). The bundled `torch-dev.sh` shell script must be included in the app target's **Copy Bundle Resources** build phase.
 
-- Edit `ContentView.swift` to change default values or add fields
-- Edit `torch-dev.sh` to modify the connection behavior
-- The script checks for `TORCH_SKIP_PROMPTS=1` to know settings came from the GUI
+---
+
+## Troubleshooting
+
+Use the built-in **Troubleshoot SSH** tool (in the Setup section) to diagnose connection issues. It checks for:
+
+- SSH key presence (`~/.ssh/id_ed25519`)
+- Stale `known_hosts` entries
+- Whether your key is authorized on the server
+- Whether the key is loaded in your SSH agent
+
+Each issue has a **Fix** button that attempts an automatic repair, or opens Terminal for steps that require interaction.
+
+---
+
+## License
+
+MIT
