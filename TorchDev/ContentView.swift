@@ -706,6 +706,20 @@ struct ConnectionProgressView: View {
     @Environment(\.dismiss) var dismiss
     @State private var showLog = false
     
+    private var detailCount: Int {
+        manager.steps.filter { $0.detail != nil }.count
+    }
+    
+    private var sheetHeight: CGFloat {
+        if showLog {
+            return 560
+        } else if manager.authRequired {
+            return 440
+        } else {
+            return 380 + CGFloat(detailCount) * 18
+        }
+    }
+    
     var body: some View {
         VStack(spacing: 16) {
             // Header
@@ -882,9 +896,10 @@ struct ConnectionProgressView: View {
             }
         }
         .padding(20)
-        .frame(width: 400, height: showLog ? 560 : (manager.authRequired ? 440 : 360))
+        .frame(width: 400, height: sheetHeight)
         .animation(.easeInOut(duration: 0.2), value: manager.authRequired)
         .animation(.easeInOut(duration: 0.2), value: showLog)
+        .animation(.easeInOut(duration: 0.2), value: detailCount)
         .sheet(isPresented: $manager.showingQueueStatus) {
             QueueStatusView(jobs: manager.queueJobs, isPresented: $manager.showingQueueStatus)
         }
@@ -1093,7 +1108,7 @@ struct QueueStatusView: View {
             .keyboardShortcut(.defaultAction)
         }
         .padding(20)
-        .frame(width: 420, height: 450)
+        .frame(width: 420, height: 360)
     }
 }
 
