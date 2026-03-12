@@ -801,7 +801,7 @@ struct ConnectionProgressView: View {
                     Button(action: { manager.checkQueue() }) {
                         HStack {
                             Image(systemName: "list.number")
-                            Text("Check Queue Status")
+                            Text("Queue Status")
                         }
                     }
                     .buttonStyle(.bordered)
