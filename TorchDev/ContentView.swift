@@ -60,6 +60,21 @@ struct QueueJob: Identifiable {
     }
 }
 
+// MARK: - Cluster Load Model
+struct ClusterPartitionInfo: Identifiable {
+    var id: String { partition }
+    let partition: String
+    let totalNodes: Int
+    let allocatedNodes: Int
+    let idleNodes: Int
+    let downNodes: Int
+    let totalCPUs: Int
+    let allocatedCPUs: Int
+    let idleCPUs: Int
+    let runningJobs: Int
+    let pendingJobs: Int
+}
+
 // MARK: - Connection Manager
 class ConnectionManager: ObservableObject {
     @Published var steps: [ConnectionStep] = []
@@ -73,6 +88,8 @@ class ConnectionManager: ObservableObject {
     @Published var isWaitingForNode = false
     @Published var queueJobs: [QueueJob] = []
     @Published var showingQueueStatus = false
+    @Published var clusterLoad: [ClusterPartitionInfo] = []
+    @Published var showingClusterLoad = false
     
     private var process: Process?
     private var inputPipe: Pipe?
@@ -297,6 +314,117 @@ class ConnectionManager: ObservableObject {
         }
         
         self.queueJobs = jobs
+    }
+    
+    func checkClusterLoad() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = ["torch", """
+            echo "=== SINFO ===" && \
+            sinfo -o '%P|%a|%D|%A|%C' --noheader 2>/dev/null && \
+            echo "=== SQUEUE_SUMMARY ===" && \
+            squeue -o '%T' --noheader 2>/dev/null | sort | uniq -c
+            """]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        
+        process.terminationHandler = { [weak self] _ in
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                DispatchQueue.main.async {
+                    self?.parseClusterLoadOutput(output)
+                    self?.showingClusterLoad = true
+                }
+            }
+        }
+        
+        try? process.run()
+    }
+    
+    private func parseClusterLoadOutput(_ output: String) {
+        var partitions: [ClusterPartitionInfo] = []
+        var jobCounts: [String: Int] = [:]
+        
+        let lines = output.components(separatedBy: .newlines)
+        var inSinfo = false
+        var inSqueueSummary = false
+        
+        for line in lines {
+            if line.contains("=== SINFO ===") {
+                inSinfo = true
+                inSqueueSummary = false
+                continue
+            }
+            if line.contains("=== SQUEUE_SUMMARY ===") {
+                inSinfo = false
+                inSqueueSummary = true
+                continue
+            }
+            
+            if inSqueueSummary {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let parts = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                if parts.count >= 2, let count = Int(parts[0]) {
+                    jobCounts[parts[1]] = count
+                }
+            }
+            
+            if inSinfo {
+                let parts = line.components(separatedBy: "|")
+                if parts.count >= 5 {
+                    let partName = parts[0].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "*", with: "")
+                    let totalNodes = Int(parts[2].trimmingCharacters(in: .whitespaces)) ?? 0
+                    
+                    // Parse allocated/idle from column 4 (format: "allocated/idle")
+                    let nodeParts = parts[3].trimmingCharacters(in: .whitespaces).components(separatedBy: "/")
+                    let allocNodes = Int(nodeParts.first ?? "0") ?? 0
+                    let idleNodes = nodeParts.count > 1 ? (Int(nodeParts[1]) ?? 0) : 0
+                    
+                    // Parse CPUs from column 5 (format: "allocated/idle/other/total")
+                    let cpuParts = parts[4].trimmingCharacters(in: .whitespaces).components(separatedBy: "/")
+                    let allocCPUs = Int(cpuParts.first ?? "0") ?? 0
+                    let idleCPUs = cpuParts.count > 1 ? (Int(cpuParts[1]) ?? 0) : 0
+                    let totalCPUs = cpuParts.count > 3 ? (Int(cpuParts[3]) ?? 0) : 0
+                    
+                    let downNodes = totalNodes - allocNodes - idleNodes
+                    
+                    partitions.append(ClusterPartitionInfo(
+                        partition: partName,
+                        totalNodes: totalNodes,
+                        allocatedNodes: allocNodes,
+                        idleNodes: idleNodes,
+                        downNodes: max(0, downNodes),
+                        totalCPUs: totalCPUs,
+                        allocatedCPUs: allocCPUs,
+                        idleCPUs: idleCPUs,
+                        runningJobs: 0,
+                        pendingJobs: 0
+                    ))
+                }
+            }
+        }
+        
+        // Attach global job counts to the first partition for display
+        let running = jobCounts["RUNNING"] ?? 0
+        let pending = jobCounts["PENDING"] ?? 0
+        if !partitions.isEmpty {
+            partitions[0] = ClusterPartitionInfo(
+                partition: partitions[0].partition,
+                totalNodes: partitions[0].totalNodes,
+                allocatedNodes: partitions[0].allocatedNodes,
+                idleNodes: partitions[0].idleNodes,
+                downNodes: partitions[0].downNodes,
+                totalCPUs: partitions[0].totalCPUs,
+                allocatedCPUs: partitions[0].allocatedCPUs,
+                idleCPUs: partitions[0].idleCPUs,
+                runningJobs: running,
+                pendingJobs: pending
+            )
+        }
+        
+        self.clusterLoad = partitions
     }
     
     private func appendLog(_ text: String) {
@@ -667,16 +795,27 @@ struct ConnectionProgressView: View {
                 }
             }
             
-            // Check Queue button (shown when waiting for allocation)
+            // Check Queue / Cluster Load buttons (shown when waiting for allocation)
             if manager.isWaitingForNode {
-                Button(action: { manager.checkQueue() }) {
-                    HStack {
-                        Image(systemName: "list.number")
-                        Text("Check Queue Status")
+                HStack(spacing: 8) {
+                    Button(action: { manager.checkQueue() }) {
+                        HStack {
+                            Image(systemName: "list.number")
+                            Text("Check Queue Status")
+                        }
                     }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    
+                    Button(action: { manager.checkClusterLoad() }) {
+                        HStack {
+                            Image(systemName: "gauge.medium")
+                            Text("Cluster Load")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
             
             // Log section with toggle
@@ -736,6 +875,9 @@ struct ConnectionProgressView: View {
         .animation(.easeInOut(duration: 0.2), value: showLog)
         .sheet(isPresented: $manager.showingQueueStatus) {
             QueueStatusView(jobs: manager.queueJobs, isPresented: $manager.showingQueueStatus)
+        }
+        .sheet(isPresented: $manager.showingClusterLoad) {
+            ClusterLoadView(partitions: manager.clusterLoad, isPresented: $manager.showingClusterLoad)
         }
     }
     
@@ -928,6 +1070,156 @@ struct QueueStatusView: View {
                     VStack(spacing: 12) {
                         ForEach(jobs) { job in
                             JobCardView(job: job)
+                        }
+                    }
+                }
+            }
+            
+            Button("Done") {
+                isPresented = false
+            }
+            .keyboardShortcut(.defaultAction)
+        }
+        .padding(20)
+        .frame(width: 420, height: 450)
+    }
+}
+
+// MARK: - Cluster Load View
+struct ClusterLoadView: View {
+    let partitions: [ClusterPartitionInfo]
+    @Binding var isPresented: Bool
+    
+    private var totalRunning: Int {
+        partitions.first?.runningJobs ?? 0
+    }
+    
+    private var totalPending: Int {
+        partitions.first?.pendingJobs ?? 0
+    }
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            // Header
+            HStack {
+                Image(systemName: "gauge.medium")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                Text("Cluster Load")
+                    .font(.headline)
+                Spacer()
+            }
+            
+            Divider()
+            
+            if partitions.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("No partition data available")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                // Global job summary
+                GroupBox {
+                    HStack(spacing: 24) {
+                        VStack(spacing: 4) {
+                            Text("\(totalRunning)")
+                                .font(.title2.bold())
+                                .foregroundStyle(.green)
+                            Text("Running")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        
+                        VStack(spacing: 4) {
+                            Text("\(totalPending)")
+                                .font(.title2.bold())
+                                .foregroundStyle(.orange)
+                            Text("Pending")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        
+                        VStack(spacing: 4) {
+                            Text("\(totalRunning + totalPending)")
+                                .font(.title2.bold())
+                                .foregroundStyle(.primary)
+                            Text("Total Jobs")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                }
+                
+                // Partition details
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(partitions) { partition in
+                            GroupBox {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(partition.partition)
+                                        .font(.headline)
+                                    
+                                    HStack(spacing: 16) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Nodes")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            HStack(spacing: 4) {
+                                                Text("\(partition.allocatedNodes)/\(partition.totalNodes)")
+                                                    .font(.system(.body, design: .monospaced))
+                                                Text("used")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("CPUs")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            HStack(spacing: 4) {
+                                                Text("\(partition.allocatedCPUs)/\(partition.totalCPUs)")
+                                                    .font(.system(.body, design: .monospaced))
+                                                Text("used")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Idle")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Text("\(partition.idleNodes) nodes")
+                                                .font(.system(.body, design: .monospaced))
+                                                .foregroundStyle(partition.idleNodes > 0 ? .green : .red)
+                                        }
+                                    }
+                                    
+                                    // Usage bar
+                                    if partition.totalNodes > 0 {
+                                        GeometryReader { geo in
+                                            let allocFraction = CGFloat(partition.allocatedNodes) / CGFloat(partition.totalNodes)
+                                            ZStack(alignment: .leading) {
+                                                RoundedRectangle(cornerRadius: 3)
+                                                    .fill(.gray.opacity(0.2))
+                                                RoundedRectangle(cornerRadius: 3)
+                                                    .fill(allocFraction > 0.9 ? .red : allocFraction > 0.7 ? .orange : .green)
+                                                    .frame(width: geo.size.width * allocFraction)
+                                            }
+                                        }
+                                        .frame(height: 6)
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
                         }
                     }
                 }
@@ -1669,22 +1961,31 @@ struct ContentView: View {
                     HStack {
                         Text("Hours")
                         Spacer()
-                        Stepper("\(hours)", value: $hours, in: 1...24)
-                            .frame(width: 120)
+                        TextField("", value: $hours, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: hours) { _ in hours = max(1, min(24, hours)) }
                     }
                     
                     HStack {
                         Text("CPUs")
                         Spacer()
-                        Stepper("\(cpus)", value: $cpus, in: 1...100)
-                            .frame(width: 120)
+                        TextField("", value: $cpus, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: cpus) { _ in cpus = max(1, min(100, cpus)) }
                     }
                     
                     HStack {
                         Text("RAM (GB)")
                         Spacer()
-                        Stepper("\(ram)", value: $ram, in: 4...500, step: 4)
-                            .frame(width: 120)
+                        TextField("", value: $ram, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: ram) { _ in ram = max(1, min(500, ram)) }
                     }
                     
                     Toggle("GPU", isOn: $gpu)
@@ -1814,6 +2115,9 @@ struct ContentView: View {
     }
     
     private func connect() {
+        hours = max(1, min(24, hours))
+        cpus = max(1, min(100, cpus))
+        ram = max(1, min(500, ram))
         showingProgress = true
         connectionManager.start(
             account: account,

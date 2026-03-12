@@ -248,7 +248,7 @@ echo "Submitted job $JOB_ID"
 # =============================================================================
 echo -e "\033[1;34mWaiting for compute node...\033[0m"
 COMPUTE_NODE=""
-for i in {1..300}; do
+for i in {1..1800}; do
     COMPUTE_NODE=$(ssh torch "squeue -j $JOB_ID -h -o '%N' 2>/dev/null | grep -v '^$'" || true)
     if [[ -n "$COMPUTE_NODE" ]]; then
         break
@@ -259,8 +259,9 @@ done
 echo
 
 if [[ -z "$COMPUTE_NODE" ]]; then
-    echo -e "\033[1;31mTimed out waiting for allocation.\033[0m"
-    echo "Check job status: ssh torch 'squeue -u $CLUSTER_USER'"
+    echo -e "\033[1;31mTimed out waiting for allocation (30 minutes).\033[0m"
+    echo "Cancelling job $JOB_ID..."
+    ssh torch "scancel $JOB_ID 2>/dev/null" || true
     exit 1
 fi
 
