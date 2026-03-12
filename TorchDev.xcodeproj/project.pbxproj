@@ -7,10 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		001 /* TorchDevApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 101; };
-		002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 102; };
-		003 /* torch-dev.sh in Resources */ = {isa = PBXBuildFile; fileRef = 103; };
-		004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 104; };
+		001 /* TorchDevApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 101 /* TorchDevApp.swift */; };
+		002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 102 /* ContentView.swift */; };
+		003 /* torch-dev.sh in Resources */ = {isa = PBXBuildFile; fileRef = 103 /* torch-dev.sh */; };
+		004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 104 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -19,10 +19,11 @@
 		102 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		103 /* torch-dev.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "torch-dev.sh"; sourceTree = "<group>"; };
 		104 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		7E1ADD792F61247D00D16778 /* TorchDev.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = TorchDev.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		200 = {
+		200 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -47,6 +48,7 @@
 				102 /* ContentView.swift */,
 				303 /* Resources */,
 				104 /* Assets.xcassets */,
+				7E1ADD792F61247D00D16778 /* TorchDev.entitlements */,
 			);
 			path = TorchDev;
 			sourceTree = "<group>";
@@ -72,7 +74,7 @@
 /* Begin PBXNativeTarget section */
 		400 /* TorchDev */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 500;
+			buildConfigurationList = 500 /* Build configuration list for PBXNativeTarget "TorchDev" */;
 			buildPhases = (
 				401 /* Sources */,
 				200 /* Frameworks */,
@@ -90,7 +92,7 @@
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		600 = {
+		600 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
@@ -102,7 +104,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 601;
+			buildConfigurationList = 601 /* Build configuration list for PBXProject "TorchDev" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -121,7 +123,7 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		402 = {
+		402 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -133,7 +135,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		401 = {
+		401 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -320,7 +322,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		500 = {
+		500 /* Build configuration list for PBXNativeTarget "TorchDev" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				702 /* Debug */,
@@ -329,7 +331,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		601 = {
+		601 /* Build configuration list for PBXProject "TorchDev" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				700 /* Debug */,
