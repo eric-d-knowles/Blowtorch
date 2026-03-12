@@ -91,6 +91,7 @@ class ConnectionManager: ObservableObject {
     @Published var clusterLoad: [ClusterPartitionInfo] = []
     @Published var showingClusterLoad = false
     
+    private var currentJobId: String?
     private var process: Process?
     private var inputPipe: Pipe?
     
@@ -111,6 +112,7 @@ class ConnectionManager: ObservableObject {
         completedSuccessfully = false
         failed = false
         isWaitingForNode = false
+        currentJobId = nil
         
         // Clean up any stale trigger file from previous runs
         let configDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/torch")
@@ -202,6 +204,15 @@ class ConnectionManager: ObservableObject {
         isRunning = false
         failed = true
         appendLog("\n— Cancelled —")
+        
+        // Cancel the Slurm job if one was submitted
+        if let jobId = currentJobId {
+            let scancelProcess = Process()
+            scancelProcess.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            scancelProcess.arguments = ["torch", "scancel \(jobId) 2>/dev/null || true"]
+            try? scancelProcess.run()
+            currentJobId = nil
+        }
     }
     
     func openAuthURL() {
@@ -482,7 +493,8 @@ class ConnectionManager: ObservableObject {
             
             // Job submitted
             if line.contains("Submitted job") {
-                if let jobId = line.components(separatedBy: " ").last {
+                if let jobId = line.components(separatedBy: " ").last?.trimmingCharacters(in: .whitespacesAndNewlines), !jobId.isEmpty {
+                    currentJobId = jobId
                     updateStep("submit", status: .success, detail: "Job \(jobId)")
                 }
                 updateStep("allocate", status: .inProgress)

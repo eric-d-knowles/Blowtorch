@@ -83,14 +83,18 @@ _kill_tunnel() {
     rm -f "$TUNNEL_PID_FILE" "$TUNNEL_PORT_FILE"
 }
 
-# --- Cleanup on abort ---
+# --- Cleanup on exit ---
+SCRIPT_SUCCESS=false
 cleanup() {
-    printf '\033[1;31mAborted. Cleaning up...\033[0m\n'
-    _kill_tunnel
-    ssh torch "scancel -u $CLUSTER_USER 2>/dev/null || true" 2>/dev/null || true
-    exit 1
+    if [[ "$SCRIPT_SUCCESS" != "true" ]]; then
+        printf '\033[1;31mCleaning up...\033[0m\n'
+        _kill_tunnel
+        if [[ -n "${JOB_ID:-}" ]]; then
+            ssh torch "scancel $JOB_ID 2>/dev/null || true" 2>/dev/null || true
+        fi
+    fi
 }
-trap cleanup INT TERM
+trap cleanup EXIT
 
 # --- Defaults ---
 DEFAULT_TIME_HOURS=2
@@ -223,7 +227,7 @@ echo
 # Step 2: Cancel old jobs and submit a new one
 # =============================================================================
 echo -e "\033[1;34mCleaning up old jobs...\033[0m"
-ssh torch "scancel -u $CLUSTER_USER 2>/dev/null || true"
+ssh torch "scancel -u $CLUSTER_USER --name=torchdev 2>/dev/null || true"
 ssh torch "mkdir -p ~/.config/torch"
 
 echo -e "\033[1;34mSubmitting job...\033[0m"
@@ -234,7 +238,7 @@ GPU_FLAG=""
 PARTITION_FLAG=""
 [[ -n "$PARTITION" ]] && PARTITION_FLAG="--partition=$PARTITION"
 
-SBATCH_CMD="sbatch --parsable --time=${TIME_HOURS}:00:00 --account=$ACCOUNT"
+SBATCH_CMD="sbatch --parsable --job-name=torchdev --time=${TIME_HOURS}:00:00 --account=$ACCOUNT"
 [[ -n "$PARTITION_FLAG" ]] && SBATCH_CMD="$SBATCH_CMD $PARTITION_FLAG"
 SBATCH_CMD="$SBATCH_CMD --cpus-per-task=$CPUS --mem=$RAM"
 [[ -n "$GPU_FLAG" ]] && SBATCH_CMD="$SBATCH_CMD $GPU_FLAG"
@@ -399,3 +403,5 @@ echo -e "  IDE:           \033[1;33m$IDE\033[0m"
 echo
 echo -e "To cancel job:   \033[1;33mssh torch 'scancel $JOB_ID'\033[0m"
 echo -e "To kill tunnel:  \033[1;33mkill \$(cat ~/.config/torch/tunnel.pid)\033[0m"
+
+SCRIPT_SUCCESS=true
