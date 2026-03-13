@@ -350,6 +350,9 @@ for i in {1..30}; do
 done
 echo
 
+# Pre-trigger automount on compute node so /scratch is ready before VS Code connects
+ssh torch-compute "ls /scratch/\$USER > /dev/null 2>&1 || true" 2>/dev/null || true
+
 # =============================================================================
 # Step 7: Launch IDE
 # =============================================================================
