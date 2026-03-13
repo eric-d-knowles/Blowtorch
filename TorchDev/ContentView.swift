@@ -1953,6 +1953,8 @@ struct ContentView: View {
     @State private var showingSSHSetup = false
     @State private var showingSSHTroubleshoot = false
     @State private var showingRemoteSetup = false
+    @State private var showingCondaSetup = false
+    @State private var showingCondaEnvSetup = false
     @State private var showingSetupAlert = false
     @State private var setupAlertMessage = ""
     
@@ -2095,6 +2097,42 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(!sshConfigManager.isConfigured)
+                    
+                    // Conda Setup
+                    Button(action: { showingCondaSetup = true }) {
+                        HStack {
+                            Image(systemName: "shippingbox.fill")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Setup Conda")
+                                Text("Configure conda on the cluster")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!sshConfigManager.isConfigured)
+                    
+                    // New Conda Environment
+                    Button(action: { showingCondaEnvSetup = true }) {
+                        HStack {
+                            Image(systemName: "cube.box")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("New Environment")
+                                Text("Create a Python or R environment")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!sshConfigManager.isConfigured)
                 }
             }
             .formStyle(.grouped)
@@ -2127,6 +2165,12 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingRemoteSetup) {
             RemoteSetupView()
+        }
+        .sheet(isPresented: $showingCondaSetup) {
+            CondaSetupView(username: sshConfigManager.currentUsername)
+        }
+        .sheet(isPresented: $showingCondaEnvSetup) {
+            CondaEnvSetupView(username: sshConfigManager.currentUsername)
         }
         .alert("Remote Setup", isPresented: $showingSetupAlert) {
             Button("OK", role: .cancel) { }
@@ -2163,6 +2207,11 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Setup Item Status (shared)
+enum SetupItemStatus {
+    case pending, checking, ok, needsAction, error, skipped
+}
+
 // MARK: - Remote Setup View
 struct RemoteSetupView: View {
     @Environment(\.dismiss) private var dismiss
@@ -2174,10 +2223,6 @@ struct RemoteSetupView: View {
     @State private var log: String = ""
     @State private var errorMessage: String = ""
     @State private var remoteUser: String = ""
-    
-    enum SetupItemStatus {
-        case pending, checking, ok, needsAction, error, skipped
-    }
     
     var body: some View {
         VStack(spacing: 20) {
@@ -2489,7 +2534,7 @@ struct RemoteSetupView: View {
 struct SetupItemRow: View {
     let title: String
     let path: String
-    let status: RemoteSetupView.SetupItemStatus
+    let status: SetupItemStatus
     
     var body: some View {
         HStack(spacing: 12) {
@@ -2531,6 +2576,806 @@ struct SetupItemRow: View {
         .padding(10)
         .background(Color.secondary.opacity(0.05))
         .cornerRadius(8)
+    }
+}
+
+// MARK: - Conda Setup View (One-Time Configuration)
+struct CondaSetupView: View {
+    let username: String
+    @Environment(\.dismiss) private var dismiss
+    
+    @State private var currentStep = 0       // 0=splash, 1=running, 2=done
+    @State private var isRunning = false
+    @State private var log: String = ""
+    @State private var errorMessage: String = ""
+    @State private var detectedCondaVersion: String = ""
+    
+    @State private var discoverStatus: SetupItemStatus = .pending
+    @State private var loadModuleStatus: SetupItemStatus = .pending
+    @State private var condaInitStatus: SetupItemStatus = .pending
+    @State private var scratchDirsStatus: SetupItemStatus = .pending
+    @State private var condarcStatus: SetupItemStatus = .pending
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            // Header
+            HStack {
+                Image(systemName: "shippingbox.fill")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                Text("Setup Conda")
+                    .font(.headline)
+                Spacer()
+            }
+            
+            if currentStep == 0 {
+                // Splash
+                VStack(spacing: 16) {
+                    Image(systemName: "shippingbox.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.blue)
+                    
+                    Text("This will configure conda on the cluster so packages install to /scratch instead of your home directory.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Find latest conda module", systemImage: "magnifyingglass")
+                        Label("Initialize conda for your shell", systemImage: "terminal")
+                        Label("Create /scratch/\(username)/.conda/", systemImage: "folder.badge.plus")
+                        Label("Configure .condarc paths", systemImage: "doc.text")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxHeight: .infinity)
+                
+            } else if currentStep == 1 {
+                // Running
+                VStack(alignment: .leading, spacing: 8) {
+                    SetupItemRow(title: "Find Conda Module",
+                                 path: detectedCondaVersion.isEmpty ? "Searching..." : detectedCondaVersion,
+                                 status: discoverStatus)
+                    SetupItemRow(title: "Verify Conda Access",
+                                 path: "conda --version",
+                                 status: loadModuleStatus)
+                    SetupItemRow(title: "Initialize Shell",
+                                 path: "~/.bashrc",
+                                 status: condaInitStatus)
+                    SetupItemRow(title: "Create Scratch Directories",
+                                 path: "/scratch/\(username)/.conda/",
+                                 status: scratchDirsStatus)
+                    SetupItemRow(title: "Configure Package Paths",
+                                 path: "~/.condarc",
+                                 status: condarcStatus)
+                }
+                
+                if !errorMessage.isEmpty {
+                    GroupBox {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                
+            } else {
+                // Done
+                VStack(spacing: 16) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.green)
+                    
+                    Text("Conda is configured!")
+                        .font(.headline)
+                    
+                    Text("Packages and environments will be stored in /scratch/\(username)/.conda/. Use \"New Environment\" to create your first project environment.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxHeight: .infinity)
+            }
+            
+            // Collapsible log
+            if !log.isEmpty {
+                DisclosureGroup("Details") {
+                    ScrollView {
+                        Text(log)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(height: 80)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            
+            // Buttons
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                if currentStep == 0 {
+                    Button("Start Setup") { runSetup() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                } else if currentStep == 2 {
+                    Button("Done") { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 400, height: 480)
+    }
+    
+    // MARK: - Setup Logic
+    
+    private func runSetup() {
+        isRunning = true
+        currentStep = 1
+        log = ""
+        errorMessage = ""
+        
+        discoverStatus = .checking
+        loadModuleStatus = .pending
+        condaInitStatus = .pending
+        scratchDirsStatus = .pending
+        condarcStatus = .pending
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Step 1: Discover conda module
+            appendLog("Searching for conda modules...\n")
+            let discoverResult = runSSHCommand("bash -lc 'module avail conda 2>&1'")
+            let version = parseLatestCondaModule(from: discoverResult.output)
+            
+            if let version = version {
+                appendLog("Found: \(version)\n")
+                DispatchQueue.main.async {
+                    detectedCondaVersion = version
+                    discoverStatus = .ok
+                    loadModuleStatus = .checking
+                }
+            } else {
+                appendLog("No conda module found.\n")
+                DispatchQueue.main.async {
+                    discoverStatus = .error
+                    errorMessage = "Could not find a conda module on the cluster."
+                    isRunning = false
+                }
+                return
+            }
+            
+            // Step 2: Verify conda access
+            appendLog("Checking conda access...\n")
+            let condaCheck = runSSHCommand("bash -lc 'conda --version 2>/dev/null && echo CONDA_AVAILABLE || (module load \(version!) && conda --version 2>/dev/null && echo CONDA_AVAILABLE || echo CONDA_MISSING)'")
+            
+            if condaCheck.output.contains("CONDA_AVAILABLE") {
+                appendLog("Conda accessible.\n")
+                DispatchQueue.main.async {
+                    loadModuleStatus = .ok
+                    condaInitStatus = .checking
+                }
+            } else {
+                appendLog("Conda not accessible after module load.\n")
+                DispatchQueue.main.async {
+                    loadModuleStatus = .error
+                    errorMessage = "Could not access conda after loading module."
+                    isRunning = false
+                }
+                return
+            }
+            
+            // Step 3: conda init
+            appendLog("Checking conda init status...\n")
+            let initCheck = runSSHCommand("grep -q '>>> conda initialize >>>' ~/.bashrc 2>/dev/null && echo ALREADY_INIT || echo NEEDS_INIT")
+            
+            if initCheck.output.contains("ALREADY_INIT") {
+                appendLog("conda init already configured.\n")
+                DispatchQueue.main.async { condaInitStatus = .ok }
+            } else {
+                appendLog("Running conda init...\n")
+                let initResult = runSSHCommand("bash -lc 'module load \(version!) && conda init bash 2>&1'")
+                appendLog(initResult.output)
+                DispatchQueue.main.async {
+                    condaInitStatus = initResult.success ? .ok : .error
+                    if !initResult.success {
+                        errorMessage = "conda init failed."
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async { scratchDirsStatus = .checking }
+            
+            // Step 4: Create scratch directories
+            appendLog("Creating scratch directories...\n")
+            let dirsResult = runSSHCommand("mkdir -p /scratch/\(username)/.conda/envs /scratch/\(username)/.conda/pkgs && echo DIRS_OK")
+            appendLog(dirsResult.output)
+            DispatchQueue.main.async {
+                scratchDirsStatus = dirsResult.output.contains("DIRS_OK") ? .ok : .error
+                if !dirsResult.output.contains("DIRS_OK") {
+                    errorMessage = "Failed to create scratch directories."
+                }
+                condarcStatus = .checking
+            }
+            
+            // Step 5: Write .condarc
+            appendLog("Checking .condarc...\n")
+            let condarcCheck = runSSHCommand("grep -q 'envs_dirs' ~/.condarc 2>/dev/null && grep -q '/scratch/\(username)' ~/.condarc 2>/dev/null && echo ALREADY_SET || echo NEEDS_WRITE")
+            
+            if condarcCheck.output.contains("ALREADY_SET") {
+                appendLog(".condarc already configured.\n")
+                DispatchQueue.main.async { condarcStatus = .ok }
+            } else {
+                appendLog("Writing .condarc...\n")
+                let writeResult = runSSHCommand("printf 'envs_dirs:\\n  - /scratch/\(username)/.conda/envs\\npkgs_dirs:\\n  - /scratch/\(username)/.conda/pkgs\\n' > ~/.condarc && echo CONDARC_OK")
+                appendLog(writeResult.output)
+                DispatchQueue.main.async {
+                    condarcStatus = writeResult.output.contains("CONDARC_OK") ? .ok : .error
+                    if !writeResult.output.contains("CONDARC_OK") {
+                        errorMessage = "Failed to write .condarc."
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async {
+                isRunning = false
+                currentStep = 2
+            }
+        }
+    }
+    
+    private func parseLatestCondaModule(from output: String) -> String? {
+        let tokens = output.components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "(D)")) }
+            .filter { !$0.isEmpty }
+        let pattern = #"^anaconda3/\d{4}\.\d{2}$"#
+        let versions = tokens.filter { $0.range(of: pattern, options: .regularExpression) != nil }
+        return versions.sorted().last
+    }
+    
+    private func appendLog(_ text: String) {
+        DispatchQueue.main.async {
+            log += text
+        }
+    }
+    
+    private func runSSHCommand(_ command: String) -> (success: Bool, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = ["torch", command]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (process.terminationStatus == 0, output)
+        } catch {
+            return (false, "Failed to run command: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MARK: - Conda Environment Setup View (Per-Project)
+struct CondaEnvSetupView: View {
+    let username: String
+    @Environment(\.dismiss) private var dismiss
+    
+    // User inputs
+    @State private var envName: String = ""
+    @State private var language: Language = .python
+    @State private var selectedVersion: String = ""
+    @State private var projectFolder: String = ""
+    
+    // Available versions (fetched via conda search)
+    @State private var availableVersions: [String] = []
+    @State private var isLoadingVersions = true
+    @State private var versionError: String = ""
+    
+    // Conda module version (discovered on appear)
+    @State private var condaModule: String = ""
+    
+    // Wizard state
+    @State private var currentStep = 0       // 0=form, 1=running, 2=done
+    @State private var isRunning = false
+    @State private var log: String = ""
+    @State private var errorMessage: String = ""
+    
+    // Per-step statuses
+    @State private var createEnvStatus: SetupItemStatus = .pending
+    @State private var verifyLangStatus: SetupItemStatus = .pending
+    @State private var registerKernelStatus: SetupItemStatus = .pending
+    @State private var projectFolderStatus: SetupItemStatus = .pending
+    
+    // Track whether we created the env (for cleanup on failure/cancel)
+    @State private var envWasCreated = false
+    @State private var currentProcess: Process?
+    
+    enum Language: String, CaseIterable, Identifiable {
+        case python = "Python"
+        case r = "R"
+        var id: String { rawValue }
+    }
+    
+    private var isValidConfig: Bool {
+        let trimmed = envName.trimmingCharacters(in: .whitespaces)
+        let nameValid = !trimmed.isEmpty
+            && trimmed.range(of: #"^[a-zA-Z][a-zA-Z0-9_-]*$"#, options: .regularExpression) != nil
+        return nameValid && !selectedVersion.isEmpty
+    }
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            // Header
+            HStack {
+                Image(systemName: "cube.box")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                Text("New Environment")
+                    .font(.headline)
+                Spacer()
+            }
+            
+            if currentStep == 0 {
+                // Configuration form
+                VStack(alignment: .leading, spacing: 16) {
+                    // Environment name
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Environment Name")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("myproject", text: $envName)
+                            .textFieldStyle(.roundedBorder)
+                        if !envName.isEmpty && !isValidConfig && selectedVersion.isEmpty == false {
+                            Text("Use letters, numbers, hyphens, and underscores. Must start with a letter.")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    
+                    // Language picker
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Language")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Picker("Language", selection: $language) {
+                            ForEach(Language.allCases) { lang in
+                                Text(lang.rawValue).tag(lang)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: language) { _ in
+                            selectedVersion = ""
+                            availableVersions = []
+                            fetchVersions()
+                        }
+                    }
+                    
+                    // Version picker
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(language.rawValue) Version")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if isLoadingVersions {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("Loading available versions...")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if !versionError.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                                    .font(.caption)
+                                Text(versionError)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button("Retry") { fetchVersions() }
+                                .font(.caption)
+                        } else if !availableVersions.isEmpty {
+                            Picker("Version", selection: $selectedVersion) {
+                                ForEach(availableVersions, id: \.self) { ver in
+                                    Text(ver).tag(ver)
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Project folder (optional)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Project Folder (optional)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("my-project", text: $projectFolder)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Creates /scratch/\(username)/\(projectFolder.isEmpty ? "<folder>" : projectFolder)/")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                
+            } else if currentStep == 1 {
+                // Running
+                VStack(alignment: .leading, spacing: 8) {
+                    SetupItemRow(title: "Create Environment",
+                                 path: "\(envName) (\(language.rawValue) \(selectedVersion))",
+                                 status: createEnvStatus)
+                    if createEnvStatus == .checking {
+                        Text("This may take a few minutes while packages are downloaded and installed.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 32)
+                    }
+                    SetupItemRow(title: "Verify \(language.rawValue)",
+                                 path: language == .python ? "python --version" : "Rscript --version",
+                                 status: verifyLangStatus)
+                    SetupItemRow(title: "Register Jupyter Kernel",
+                                 path: language == .python ? "ipykernel" : "IRkernel",
+                                 status: registerKernelStatus)
+                    SetupItemRow(title: "Create Project Folder",
+                                 path: projectFolder.isEmpty ? "Skipped" : "/scratch/\(username)/\(projectFolder)/",
+                                 status: projectFolderStatus)
+                }
+                
+                if !errorMessage.isEmpty {
+                    GroupBox {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                
+            } else {
+                // Done
+                VStack(spacing: 16) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.green)
+                    
+                    Text("Environment created!")
+                        .font(.headline)
+                    
+                    VStack(spacing: 4) {
+                        Text("Environment: \(envName)")
+                            .font(.caption.bold())
+                        Text("Kernel: \(language.rawValue) (\(envName))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if !projectFolder.isEmpty {
+                            Text("Folder: /scratch/\(username)/\(projectFolder)/")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    
+                    Text("Select this kernel in Jupyter or your IDE to use this environment.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxHeight: .infinity)
+            }
+            
+            // Collapsible log
+            if !log.isEmpty {
+                DisclosureGroup("Details") {
+                    ScrollView {
+                        Text(log)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(height: 80)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            
+            Spacer()
+            
+            // Buttons
+            HStack {
+                if currentStep == 1 && isRunning {
+                    Button("Cancel") { cancelSetup() }
+                        .keyboardShortcut(.cancelAction)
+                } else if currentStep == 2 {
+                    Button("Done") { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                Spacer()
+                if currentStep == 0 {
+                    Button("Create Environment") { runSetup() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!isValidConfig)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 420, height: 520)
+        .onAppear {
+            discoverCondaModule()
+        }
+    }
+    
+    // MARK: - Version Discovery
+    
+    private func discoverCondaModule() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runSSHCommand("bash -lc 'module avail conda 2>&1'")
+            let version = parseLatestCondaModule(from: result.output)
+            DispatchQueue.main.async {
+                condaModule = version ?? "anaconda3"
+                fetchVersions()
+            }
+        }
+    }
+    
+    private func fetchVersions() {
+        isLoadingVersions = true
+        versionError = ""
+        availableVersions = []
+        selectedVersion = ""
+        
+        let mod = condaModule
+        guard !mod.isEmpty else {
+            versionError = "Conda module not yet discovered."
+            isLoadingVersions = false
+            return
+        }
+        
+        let lang = language
+        // Use conda search with a version filter to limit output size
+        let searchExpr = lang == .python ? "\"python>=3.8\"" : "\"r-base>=4.0\""
+        let packageName = lang == .python ? "python" : "r-base"
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Use plain-text output (much smaller than JSON) and extract version column
+            let result = runSSHCommand("bash -lc 'module load \(mod) 2>/dev/null && conda search \(searchExpr) 2>/dev/null'")
+            
+            if result.success {
+                // Plain-text output has lines like:
+                //   python   3.11.5   h7a1cb2a_0   conda-forge
+                // First line(s) may be headers. Extract version from column 2.
+                var versionSet = Set<String>()
+                let lines = result.output.components(separatedBy: .newlines)
+                for line in lines {
+                    let cols = line.split(separator: " ", omittingEmptySubsequences: true)
+                            .map { String($0).trimmingCharacters(in: .whitespaces) }
+                    // Expect: name version build channel
+                    guard cols.count >= 3,
+                          cols[0] == packageName else { continue }
+                    let ver = cols[1]
+                    let parts = ver.split(separator: ".")
+                    if parts.count >= 2 {
+                        let majorMinor = "\(parts[0]).\(parts[1])"
+                        versionSet.insert(majorMinor)
+                    }
+                }
+                
+                if !versionSet.isEmpty {
+                    let sorted = versionSet.sorted { v1, v2 in
+                        v1.compare(v2, options: .numeric) == .orderedAscending
+                    }.reversed().map { String($0) }
+                    
+                    DispatchQueue.main.async {
+                        availableVersions = Array(sorted)
+                        selectedVersion = availableVersions.first ?? ""
+                        isLoadingVersions = false
+                    }
+                    return
+                }
+            }
+            
+            appendLog("Version fetch failed. Output:\n\(result.output.prefix(500))\n")
+            DispatchQueue.main.async {
+                versionError = "Could not fetch available versions."
+                isLoadingVersions = false
+            }
+        }
+    }
+    
+    // MARK: - Setup Logic
+    
+    private func runSetup() {
+        isRunning = true
+        currentStep = 1
+        log = ""
+        errorMessage = ""
+        
+        createEnvStatus = .checking
+        verifyLangStatus = .pending
+        registerKernelStatus = .pending
+        projectFolderStatus = projectFolder.isEmpty ? .skipped : .pending
+        
+        let mod = condaModule
+        let name = envName.trimmingCharacters(in: .whitespaces)
+        let ver = selectedVersion
+        let lang = language
+        let folder = projectFolder.trimmingCharacters(in: .whitespaces)
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Step 1: Create environment (with idempotency check)
+            appendLog("Checking if environment '\(name)' exists...\n")
+            let envCheck = runSSHCommand("bash -lc 'module load \(mod) && conda env list 2>/dev/null | grep -q \"^\\s*\(name) \" && echo EXISTS || echo MISSING'")
+            
+            if envCheck.output.contains("EXISTS") {
+                appendLog("Environment '\(name)' already exists.\n")
+                DispatchQueue.main.async { createEnvStatus = .ok }
+            } else {
+                appendLog("Creating environment '\(name)'...\n")
+                let packageSpec = lang == .python ? "python=\(ver)" : "r-base=\(ver)"
+                let createResult = runSSHCommand("bash -lc 'module load \(mod) && conda create -n \(name) \(packageSpec) -y 2>&1'")
+                appendLog(createResult.output)
+                if createResult.success {
+                    DispatchQueue.main.async {
+                        envWasCreated = true
+                        createEnvStatus = .ok
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        createEnvStatus = .error
+                        errorMessage = "Failed to create environment."
+                        isRunning = false
+                    }
+                    // Clean up the partial env
+                    cleanupFailedEnv()
+                    return
+                }
+            }
+            
+            // Step 2: Verify language
+            DispatchQueue.main.async { verifyLangStatus = .checking }
+            appendLog("Verifying \(lang.rawValue) installation...\n")
+            let verifyCmd = lang == .python
+                ? "bash -lc 'module load \(mod) && conda run -n \(name) python --version 2>&1'"
+                : "bash -lc 'module load \(mod) && conda run -n \(name) Rscript --version 2>&1'"
+            let verifyResult = runSSHCommand(verifyCmd)
+            appendLog(verifyResult.output)
+            DispatchQueue.main.async {
+                verifyLangStatus = verifyResult.success ? .ok : .error
+                if !verifyResult.success {
+                    errorMessage = "\(lang.rawValue) verification failed."
+                }
+            }
+            
+            // Step 3: Register Jupyter kernel
+            DispatchQueue.main.async { registerKernelStatus = .checking }
+            appendLog("Checking for existing kernel...\n")
+            let kernelCheck = runSSHCommand("bash -lc 'module load \(mod) && conda run -n \(name) jupyter kernelspec list 2>/dev/null | grep -q \"\(name)\" && echo KERNEL_EXISTS || echo KERNEL_MISSING'")
+            
+            if kernelCheck.output.contains("KERNEL_EXISTS") {
+                appendLog("Kernel '\(name)' already registered.\n")
+                DispatchQueue.main.async { registerKernelStatus = .ok }
+            } else {
+                appendLog("Registering kernel...\n")
+                let kernelCmd: String
+                if lang == .python {
+                    kernelCmd = "bash -lc 'module load \(mod) && conda run -n \(name) pip install ipykernel 2>&1 && conda run -n \(name) python -m ipykernel install --user --name \(name) --display-name \"Python (\(name))\" 2>&1'"
+                } else {
+                    kernelCmd = "bash -lc 'module load \(mod) && conda run -n \(name) Rscript -e \"install.packages(\\\"IRkernel\\\", repos=\\\"https://cloud.r-project.org\\\")\" 2>&1 && conda run -n \(name) Rscript -e \"IRkernel::installspec(name=\\\"\(name)\\\", displayname=\\\"R (\(name))\\\")\" 2>&1'"
+                }
+                let kernelResult = runSSHCommand(kernelCmd)
+                appendLog(kernelResult.output)
+                DispatchQueue.main.async {
+                    registerKernelStatus = kernelResult.success ? .ok : .error
+                    if !kernelResult.success {
+                        errorMessage = "Failed to register kernel."
+                    }
+                }
+            }
+            
+            // Step 4: Create project folder (if specified)
+            if !folder.isEmpty {
+                DispatchQueue.main.async { projectFolderStatus = .checking }
+                appendLog("Creating project folder...\n")
+                let folderResult = runSSHCommand("mkdir -p /scratch/\(username)/\(folder) && echo FOLDER_OK")
+                appendLog(folderResult.output)
+                DispatchQueue.main.async {
+                    projectFolderStatus = folderResult.output.contains("FOLDER_OK") ? .ok : .error
+                    if !folderResult.output.contains("FOLDER_OK") {
+                        errorMessage = "Failed to create project folder."
+                    }
+                }
+            }
+            
+            DispatchQueue.main.async {
+                isRunning = false
+                currentStep = 2
+            }
+        }
+    }
+    
+    private func parseLatestCondaModule(from output: String) -> String? {
+        let tokens = output.components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "(D)")) }
+            .filter { !$0.isEmpty }
+        let pattern = #"^anaconda3/\d{4}\.\d{2}$"#
+        let versions = tokens.filter { $0.range(of: pattern, options: .regularExpression) != nil }
+        return versions.sorted().last
+    }
+    
+    private func appendLog(_ text: String) {
+        DispatchQueue.main.async {
+            log += text
+        }
+    }
+    
+    private func runSSHCommand(_ command: String) -> (success: Bool, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        process.arguments = ["torch", command]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        
+        DispatchQueue.main.async { currentProcess = process }
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            DispatchQueue.main.async { currentProcess = nil }
+            return (process.terminationStatus == 0, output)
+        } catch {
+            DispatchQueue.main.async { currentProcess = nil }
+            return (false, "Failed to run command: \(error.localizedDescription)")
+        }
+    }
+    
+    private func cancelSetup() {
+        currentProcess?.terminate()
+        currentProcess = nil
+        isRunning = false
+        
+        // Clean up partial environment in the background
+        if envWasCreated {
+            let mod = condaModule
+            let name = envName.trimmingCharacters(in: .whitespaces)
+            DispatchQueue.global(qos: .utility).async {
+                let _ = runSSHCommand("bash -lc 'module load \(mod) && conda env remove -n \(name) -y 2>&1'")
+            }
+        }
+        
+        dismiss()
+    }
+    
+    private func cleanupFailedEnv() {
+        let mod = condaModule
+        let name = envName.trimmingCharacters(in: .whitespaces)
+        appendLog("Cleaning up partial environment '\(name)'...\n")
+        DispatchQueue.global(qos: .utility).async {
+            let result = runSSHCommand("bash -lc 'module load \(mod) && conda env remove -n \(name) -y 2>&1'")
+            appendLog(result.output)
+            DispatchQueue.main.async {
+                envWasCreated = false
+            }
+        }
     }
 }
 
