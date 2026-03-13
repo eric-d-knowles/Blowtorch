@@ -75,6 +75,274 @@ struct ClusterPartitionInfo: Identifiable {
     let pendingJobs: Int
 }
 
+// MARK: - SSH Auth Manager
+// Shared authentication helper. Establishes a ControlMaster session to the
+// torch login node, surfacing the browser PIN and URL for the UI to display.
+class SSHAuthManager: ObservableObject {
+    @Published var authRequired = false
+    @Published var authPIN: String = ""
+    @Published var authURL: String = "https://login.microsoft.com/device"
+    @Published var isAuthenticating = false
+    @Published var errorMessage: String = ""
+
+    private var process: Process?
+    private var inputPipe: Pipe?
+    private var outputPipe: Pipe?
+    private var onReady: (() -> Void)?
+
+    /// Returns true if a ControlMaster session to torch is already active.
+    func isConnected() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-O", "check", "torch"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    /// Ensures a ControlMaster session exists, triggering auth if needed.
+    /// Calls `onReady` on the main queue when connected, or sets `errorMessage` on failure.
+    func ensureConnected(onReady: @escaping () -> Void) {
+        if isConnected() {
+            onReady()
+            return
+        }
+
+        DispatchQueue.main.async {
+            self.isAuthenticating = true
+            self.authRequired = false
+            self.authPIN = ""
+            self.errorMessage = ""
+        }
+
+        // Run ssh -NM (foreground) via PTY so the process stays alive and we can
+        // capture the auth PIN. The process exits only after the ControlMaster closes.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        p.arguments = ["-q", "/dev/null", "/usr/bin/ssh", "-NM", "torch"]
+
+        let out = Pipe()
+        let inp = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        p.standardInput = inp
+
+        process = p
+        inputPipe = inp
+        outputPipe = out
+
+        out.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            let data = handle.availableData
+            guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+            DispatchQueue.main.async {
+                if text.contains("NEEDS_AUTH") || text.contains("browser") || text.contains("microsoft.com") {
+                    self.authRequired = true
+                    self.isAuthenticating = false
+                }
+                // Extract PIN — typically "Enter code XXXXXXXX"
+                if let range = text.range(of: #"[A-Z0-9]{8,9}"#, options: .regularExpression) {
+                    let candidate = String(text[range])
+                    if candidate != self.authPIN {
+                        self.authPIN = candidate
+                    }
+                }
+                // Extract URL
+                if let range = text.range(of: #"https://\S+"#, options: .regularExpression) {
+                    self.authURL = String(text[range])
+                }
+            }
+        }
+
+        // If the process exits unexpectedly (e.g. auth rejected), clean up.
+        p.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            out.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async {
+                guard self.isAuthenticating || self.authRequired else { return }
+                self.isAuthenticating = false
+                self.authRequired = false
+                self.authPIN = ""
+                self.errorMessage = "SSH process exited unexpectedly. Please try again."
+            }
+        }
+
+        do {
+            try p.run()
+        } catch {
+            DispatchQueue.main.async {
+                self.isAuthenticating = false
+                self.errorMessage = "Failed to start SSH: \(error.localizedDescription)"
+            }
+        }
+
+        self.onReady = onReady
+    }
+
+    /// Send Enter to the SSH process after the user completes browser sign-in,
+    /// then poll until the ControlMaster socket appears and call onReady.
+    func continueAfterAuth() {
+        if let data = "\n".data(using: .utf8) {
+            inputPipe?.fileHandleForWriting.write(data)
+        }
+        authRequired = false
+        authPIN = ""
+        isAuthenticating = true
+
+        // Poll for ControlMaster socket — ssh -NM stays running as the master,
+        // so we can't wait for process exit. Instead poll isConnected().
+        pollForConnection()
+    }
+
+    private func pollForConnection(attempts: Int = 0) {
+        guard attempts < 20 else {
+            DispatchQueue.main.async {
+                self.isAuthenticating = false
+                self.errorMessage = "Timed out waiting for SSH connection. Please try again."
+            }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            if self.isConnected() {
+                DispatchQueue.main.async {
+                    self.isAuthenticating = false
+                    self.errorMessage = ""
+                    self.onReady?()
+                    self.onReady = nil
+                }
+            } else {
+                self.pollForConnection(attempts: attempts + 1)
+            }
+        }
+    }
+
+    func openAuthURL() {
+        if let url = URL(string: authURL) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+// MARK: - SSH Auth Card View
+// Drop-in card shown whenever SSHAuthManager.authRequired is true.
+struct SSHAuthCardView: View {
+    @ObservedObject var auth: SSHAuthManager
+
+    var body: some View {
+        GroupBox {
+            VStack(spacing: 12) {
+                Image(systemName: "person.badge.key.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.blue)
+
+                Text("Sign in Required")
+                    .font(.headline)
+
+                if !auth.authPIN.isEmpty {
+                    VStack(spacing: 4) {
+                        Text("Enter this code:")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        HStack(spacing: 8) {
+                            Text(auth.authPIN)
+                                .font(.system(size: 28, weight: .bold, design: .monospaced))
+                                .textSelection(.enabled)
+
+                            Button(action: {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(auth.authPIN, forType: .string)
+                            }) {
+                                Image(systemName: "doc.on.doc")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Copy to clipboard")
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+
+                Button(action: { auth.openAuthURL() }) {
+                    HStack {
+                        Image(systemName: "safari")
+                        Text("Open Browser")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+
+                Button(action: { auth.continueAfterAuth() }) {
+                    HStack {
+                        Image(systemName: "arrow.right.circle.fill")
+                        Text("Continue")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+
+                Text("Complete sign-in in browser, then click Continue.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(12)
+        }
+    }
+}
+
+// MARK: - Shared SSH Utilities
+
+/// Runs a command on the torch login node via the existing ControlMaster session.
+/// Must be called from a background thread (blocks until the command completes).
+/// The optional `processCallback` is called on the main thread with the Process just before launch,
+/// allowing the caller to store it for cancellation.
+func runSSHCommand(_ command: String, processCallback: ((Process?) -> Void)? = nil) -> (success: Bool, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+    process.arguments = ["torch", command]
+
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+
+    if let cb = processCallback {
+        DispatchQueue.main.async { cb(process) }
+    }
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        if let cb = processCallback {
+            DispatchQueue.main.async { cb(nil) }
+        }
+        return (process.terminationStatus == 0, output)
+    } catch {
+        if let cb = processCallback {
+            DispatchQueue.main.async { cb(nil) }
+        }
+        return (false, error.localizedDescription)
+    }
+}
+
+/// Parses `module avail conda` output and returns the latest anaconda3/YYYY.MM module name.
+func parseLatestCondaModule(from output: String) -> String? {
+    let tokens = output.components(separatedBy: .whitespacesAndNewlines)
+        .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "(D)")) }
+        .filter { !$0.isEmpty }
+    let pattern = #"^anaconda3/\d{4}\.\d{2}$"#
+    let versions = tokens.filter { $0.range(of: pattern, options: .regularExpression) != nil }
+    return versions.sorted().last
+}
+
 // MARK: - Connection Manager
 class ConnectionManager: ObservableObject {
     @Published var steps: [ConnectionStep] = []
@@ -1391,17 +1659,11 @@ struct PriorityBadge: View {
 struct SSHTroubleshootView: View {
     @Environment(\.dismiss) private var dismiss
     
+    @StateObject private var auth = SSHAuthManager()
     @State private var checks: [SSHCheck] = []
     @State private var isRunning = false
     @State private var log: String = ""
     @State private var showLog = false
-    
-    // Auth UI state (for key upload)
-    @State private var authRequired = false
-    @State private var authPIN: String = ""
-    @State private var authURL: String = "https://login.microsoft.com/device"
-    @State private var pendingFixAfterAuth: String? = nil
-    @State private var inputPipe: Pipe? = nil
     
     var body: some View {
         VStack(spacing: 16) {
@@ -1429,71 +1691,13 @@ struct SSHTroubleshootView: View {
             }
             
             // Auth card (shown when key upload needs SSH auth)
-            if authRequired {
+            if auth.authRequired {
+                SSHAuthCardView(auth: auth)
+            } else if !auth.errorMessage.isEmpty {
                 GroupBox {
-                    VStack(spacing: 12) {
-                        Image(systemName: "person.badge.key.fill")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.blue)
-                        
-                        Text("Sign in Required")
-                            .font(.headline)
-                        
-                        if !authPIN.isEmpty {
-                            VStack(spacing: 4) {
-                                Text("Enter this code:")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                
-                                HStack(spacing: 8) {
-                                    Text(authPIN)
-                                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                                        .textSelection(.enabled)
-                                    
-                                    Button(action: {
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(authPIN, forType: .string)
-                                    }) {
-                                        Image(systemName: "doc.on.doc")
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help("Copy to clipboard")
-                                }
-                            }
-                            .padding(.vertical, 4)
-                        }
-                        
-                        Button(action: {
-                            if let url = URL(string: authURL) {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }) {
-                            HStack {
-                                Image(systemName: "safari")
-                                Text("Open Browser")
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                        
-                        Button(action: continueAfterAuth) {
-                            HStack {
-                                Image(systemName: "arrow.right.circle.fill")
-                                Text("Continue")
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
-                        
-                        Text("Complete sign-in in browser, then click Continue.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(8)
+                    Text(auth.errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
             
@@ -1668,21 +1872,15 @@ struct SSHTroubleshootView: View {
                 }
                 
             case "key_on_server":
-                // Upload key: first check if SSH is connected
+                // Ensure SSH connection (triggers auth UI if needed), then upload key
                 appendLog("\n→ Checking SSH connection...")
-                let authCheck = runCommand("/usr/bin/ssh", args: ["-O", "check", "torch"])
-                
-                if authCheck.success {
-                    // Already connected — upload key directly
-                    uploadKeyToServer()
-                } else {
-                    // Need to authenticate first — run ssh -fNM via PTY to get the PIN
-                    appendLog("→ SSH not connected, starting authentication...")
-                    DispatchQueue.main.async {
-                        pendingFixAfterAuth = "key_on_server"
-                        updateCheck("key_on_server", status: .fixing, description: "Authenticating...")
+                DispatchQueue.main.async {
+                    updateCheck("key_on_server", status: .fixing, description: "Connecting...")
+                    auth.ensureConnected {
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            uploadKeyToServer()
+                        }
                     }
-                    startSSHAuth()
                 }
                 
             case "agent":
@@ -1749,87 +1947,6 @@ struct SSHTroubleshootView: View {
                 appendLog("✗ Failed: \(installResult.output)")
             }
         }
-    }
-    
-    private func startSSHAuth() {
-        // Run ssh -fNM torch via PTY using 'script' to capture the auth PIN output
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
-        process.arguments = ["-q", "/dev/null", "/usr/bin/ssh", "-fNM", "torch"]
-        
-        let outputPipe = Pipe()
-        let input = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = outputPipe
-        process.standardInput = input
-        
-        DispatchQueue.main.async {
-            inputPipe = input
-        }
-        
-        outputPipe.fileHandleForReading.readabilityHandler = { [self] handle in
-            let data = handle.availableData
-            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                DispatchQueue.main.async {
-                    // Look for auth PIN
-                    if output.contains("Authenticate with PIN") || output.contains("NEEDS_AUTH") {
-                        authRequired = true
-                        
-                        if let pinMatch = output.range(of: "PIN\\s+([A-Z0-9]+)", options: .regularExpression) {
-                            let pinSubstring = output[pinMatch]
-                            authPIN = pinSubstring.replacingOccurrences(of: "PIN ", with: "").trimmingCharacters(in: .whitespaces)
-                        }
-                        
-                        if let urlMatch = output.range(of: "https://[^\\s]+", options: .regularExpression) {
-                            authURL = String(output[urlMatch])
-                        }
-                    }
-                }
-            }
-        }
-        
-        process.terminationHandler = { [self] proc in
-            DispatchQueue.main.async {
-                authRequired = false
-                authPIN = ""
-                outputPipe.fileHandleForReading.readabilityHandler = nil
-                
-                // Check if auth succeeded
-                let check = runCommand("/usr/bin/ssh", args: ["-O", "check", "torch"])
-                if check.success {
-                    appendLog("✓ Authenticated successfully")
-                    // Now run the pending fix
-                    if pendingFixAfterAuth == "key_on_server" {
-                        pendingFixAfterAuth = nil
-                        DispatchQueue.global(qos: .userInitiated).async {
-                            uploadKeyToServer()
-                        }
-                    }
-                } else {
-                    updateCheck(pendingFixAfterAuth ?? "key_on_server", status: .needsFix, description: "Authentication failed — try again")
-                    appendLog("✗ Authentication failed")
-                    pendingFixAfterAuth = nil
-                }
-            }
-        }
-        
-        do {
-            try process.run()
-        } catch {
-            DispatchQueue.main.async {
-                updateCheck("key_on_server", status: .needsFix, description: "Failed to start SSH")
-                appendLog("✗ Failed to start SSH: \(error)")
-            }
-        }
-    }
-    
-    private func continueAfterAuth() {
-        // Send Enter to the ssh process to proceed after browser auth
-        if let data = "\n".data(using: .utf8) {
-            inputPipe?.fileHandleForWriting.write(data)
-        }
-        authRequired = false
-        authPIN = ""
     }
     
     private func updateCheck(_ id: String, status: SSHCheckStatus, description: String? = nil) {
@@ -2217,6 +2334,7 @@ enum SetupItemStatus {
 struct RemoteSetupView: View {
     @Environment(\.dismiss) private var dismiss
     
+    @StateObject private var auth = SSHAuthManager()
     @State private var currentStep = 0
     @State private var isRunning = false
     @State private var vscodeStatus: SetupItemStatus = .pending
@@ -2242,6 +2360,24 @@ struct RemoteSetupView: View {
                 .foregroundStyle(.secondary)
             
             Divider()
+            
+            // Auth card (shown when SSH authentication is needed)
+            if auth.authRequired {
+                SSHAuthCardView(auth: auth)
+            } else if auth.isAuthenticating {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("Connecting to torch...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if !auth.errorMessage.isEmpty {
+                GroupBox {
+                    Text(auth.errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
             
             if currentStep == 0 {
                 // Step 0: Ready to start
@@ -2348,7 +2484,7 @@ struct RemoteSetupView: View {
                 if currentStep == 0 {
                     Button(action: runSetup) {
                         HStack {
-                            if isRunning {
+                            if isRunning || auth.isAuthenticating {
                                 ProgressView()
                                     .scaleEffect(0.7)
                             }
@@ -2356,7 +2492,7 @@ struct RemoteSetupView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isRunning)
+                    .disabled(isRunning || auth.isAuthenticating || auth.authRequired)
                 } else if currentStep == 2 {
                     Button("Done") {
                         dismiss()
@@ -2367,16 +2503,23 @@ struct RemoteSetupView: View {
             }
         }
         .padding(20)
-        .frame(width: 400, height: 420)
+        .frame(width: 400, height: 480)
     }
     
     private func runSetup() {
         isRunning = true
-        currentStep = 1
         log = ""
         errorMessage = ""
-        vscodeStatus = .checking
         
+        // Ensure SSH connection (triggers auth UI if needed) before running setup
+        auth.ensureConnected {
+            self.currentStep = 1
+            self.vscodeStatus = .checking
+            self.runSetupSteps()
+        }
+    }
+    
+    private func runSetupSteps() {
         DispatchQueue.global(qos: .userInitiated).async {
             // Get remote username
             appendLog("Connecting to torch...")
@@ -2460,7 +2603,7 @@ struct RemoteSetupView: View {
             
         case "SYMLINK_OTHER":
             appendLog("  → Updating symlink...")
-            let result = runSSHCommand("rm '\(homePath)' && mkdir -p '\(scratchPath)' && ln -s '\(scratchPath)' '\(homePath)'")
+            let result = runSSHCommand("mkdir -p '\(scratchPath)' ; ln -sf '\(scratchPath)' '\(homePath)'")
             if result.success {
                 appendLog("  ✓ Updated symlink")
                 statusUpdate(.ok)
@@ -2473,10 +2616,10 @@ struct RemoteSetupView: View {
             appendLog("  → Moving existing directory...")
             // Move contents to scratch, then create symlink
             let result = runSSHCommand("""
-                mkdir -p '\(scratchPath)' && \
-                cp -r '\(homePath)/'* '\(scratchPath)/' 2>/dev/null || true && \
-                rm -rf '\(homePath)' && \
-                ln -s '\(scratchPath)' '\(homePath)'
+                mkdir -p '\(scratchPath)' ; \
+                cp -r '\(homePath)/'* '\(scratchPath)/' 2>/dev/null || true ; \
+                rm -rf '\(homePath)' ; \
+                ln -sf '\(scratchPath)' '\(homePath)'
             """)
             if result.success {
                 appendLog("  ✓ Moved to scratch and created symlink")
@@ -2488,7 +2631,7 @@ struct RemoteSetupView: View {
             
         case "NONE":
             appendLog("  → Creating symlink...")
-            let result = runSSHCommand("mkdir -p '\(scratchPath)' && ln -s '\(scratchPath)' '\(homePath)'")
+            let result = runSSHCommand("mkdir -p '\(scratchPath)' ; ln -sf '\(scratchPath)' '\(homePath)'")
             if result.success {
                 appendLog("  ✓ Created symlink")
                 statusUpdate(.ok)
@@ -2500,28 +2643,6 @@ struct RemoteSetupView: View {
         default:
             appendLog("  ✗ Unexpected state: \(state)")
             statusUpdate(.error)
-        }
-    }
-    
-    private func runSSHCommand(_ command: String) -> (success: Bool, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = ["torch", command]
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        
-        do {
-            try process.run()
-            process.waitUntilExit()
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            return (process.terminationStatus == 0, output)
-        } catch {
-            return (false, error.localizedDescription)
         }
     }
     
@@ -2585,6 +2706,7 @@ struct CondaSetupView: View {
     let username: String
     @Environment(\.dismiss) private var dismiss
     
+    @StateObject private var auth = SSHAuthManager()
     @State private var currentStep = 0       // 0=splash, 1=running, 2=done
     @State private var isRunning = false
     @State private var log: String = ""
@@ -2682,6 +2804,24 @@ struct CondaSetupView: View {
                 .frame(maxHeight: .infinity)
             }
             
+            // Auth card (shown when SSH authentication is needed)
+            if auth.authRequired {
+                SSHAuthCardView(auth: auth)
+            } else if auth.isAuthenticating {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("Connecting to torch...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if !auth.errorMessage.isEmpty {
+                GroupBox {
+                    Text(auth.errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+            
             // Collapsible log
             if !log.isEmpty {
                 DisclosureGroup("Details") {
@@ -2703,9 +2843,17 @@ struct CondaSetupView: View {
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 if currentStep == 0 {
-                    Button("Start Setup") { runSetup() }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
+                    Button(action: runSetup) {
+                        HStack {
+                            if auth.isAuthenticating {
+                                ProgressView().scaleEffect(0.7)
+                            }
+                            Text("Start Setup")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(auth.isAuthenticating || auth.authRequired)
                 } else if currentStep == 2 {
                     Button("Done") { dismiss() }
                         .buttonStyle(.borderedProminent)
@@ -2714,23 +2862,28 @@ struct CondaSetupView: View {
             }
         }
         .padding(20)
-        .frame(width: 400, height: 480)
+        .frame(width: 400, height: 520)
     }
     
     // MARK: - Setup Logic
     
     private func runSetup() {
         isRunning = true
-        currentStep = 1
         log = ""
         errorMessage = ""
-        
-        discoverStatus = .checking
-        loadModuleStatus = .pending
-        condaInitStatus = .pending
-        scratchDirsStatus = .pending
-        condarcStatus = .pending
-        
+
+        auth.ensureConnected {
+            self.currentStep = 1
+            self.discoverStatus = .checking
+            self.loadModuleStatus = .pending
+            self.condaInitStatus = .pending
+            self.scratchDirsStatus = .pending
+            self.condarcStatus = .pending
+            self.runSetupSteps()
+        }
+    }
+
+    private func runSetupSteps() {
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Discover conda module
             appendLog("Searching for conda modules...\n")
@@ -2833,38 +2986,9 @@ struct CondaSetupView: View {
         }
     }
     
-    private func parseLatestCondaModule(from output: String) -> String? {
-        let tokens = output.components(separatedBy: .whitespacesAndNewlines)
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "(D)")) }
-            .filter { !$0.isEmpty }
-        let pattern = #"^anaconda3/\d{4}\.\d{2}$"#
-        let versions = tokens.filter { $0.range(of: pattern, options: .regularExpression) != nil }
-        return versions.sorted().last
-    }
-    
     private func appendLog(_ text: String) {
         DispatchQueue.main.async {
             log += text
-        }
-    }
-    
-    private func runSSHCommand(_ command: String) -> (success: Bool, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = ["torch", command]
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return (process.terminationStatus == 0, output)
-        } catch {
-            return (false, "Failed to run command: \(error.localizedDescription)")
         }
     }
 }
@@ -2873,6 +2997,8 @@ struct CondaSetupView: View {
 struct CondaEnvSetupView: View {
     let username: String
     @Environment(\.dismiss) private var dismiss
+    
+    @StateObject private var auth = SSHAuthManager()
     
     // User inputs
     @State private var envName: String = ""
@@ -3076,6 +3202,24 @@ struct CondaEnvSetupView: View {
                 .frame(maxHeight: .infinity)
             }
             
+            // Auth card (shown when SSH authentication is needed)
+            if auth.authRequired {
+                SSHAuthCardView(auth: auth)
+            } else if auth.isAuthenticating {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("Connecting to torch...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if !auth.errorMessage.isEmpty {
+                GroupBox {
+                    Text(auth.errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+            
             // Collapsible log
             if !log.isEmpty {
                 DisclosureGroup("Details") {
@@ -3111,12 +3255,12 @@ struct CondaEnvSetupView: View {
                     Button("Create Environment") { runSetup() }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!isValidConfig)
+                        .disabled(!isValidConfig || auth.isAuthenticating || auth.authRequired)
                 }
             }
         }
         .padding(20)
-        .frame(width: 420, height: 520)
+        .frame(width: 420, height: 540)
         .onAppear {
             discoverCondaModule()
         }
@@ -3125,12 +3269,14 @@ struct CondaEnvSetupView: View {
     // MARK: - Version Discovery
     
     private func discoverCondaModule() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = runSSHCommand("bash -lc 'module avail conda 2>&1'")
-            let version = parseLatestCondaModule(from: result.output)
-            DispatchQueue.main.async {
-                condaModule = version ?? "anaconda3"
-                fetchVersions()
+        auth.ensureConnected {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = runSSHCommand("bash -lc 'module avail conda 2>&1'")
+                let version = parseLatestCondaModule(from: result.output)
+                DispatchQueue.main.async {
+                    condaModule = version ?? "anaconda3"
+                    fetchVersions()
+                }
             }
         }
     }
@@ -3203,21 +3349,26 @@ struct CondaEnvSetupView: View {
     
     private func runSetup() {
         isRunning = true
-        currentStep = 1
         log = ""
         errorMessage = ""
-        
-        createEnvStatus = .checking
-        verifyLangStatus = .pending
-        registerKernelStatus = .pending
-        projectFolderStatus = projectFolder.isEmpty ? .skipped : .pending
-        
+
+        auth.ensureConnected {
+            self.currentStep = 1
+            self.createEnvStatus = .checking
+            self.verifyLangStatus = .pending
+            self.registerKernelStatus = .pending
+            self.projectFolderStatus = self.projectFolder.isEmpty ? .skipped : .pending
+            self.runSetupSteps()
+        }
+    }
+
+    private func runSetupSteps() {
         let mod = condaModule
         let name = envName.trimmingCharacters(in: .whitespaces)
         let ver = selectedVersion
         let lang = language
         let folder = projectFolder.trimmingCharacters(in: .whitespaces)
-        
+
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Create environment (with idempotency check)
             appendLog("Checking if environment '\(name)' exists...\n")
@@ -3229,7 +3380,8 @@ struct CondaEnvSetupView: View {
             } else {
                 appendLog("Creating environment '\(name)'...\n")
                 let packageSpec = lang == .python ? "python=\(ver)" : "r-base=\(ver)"
-                let createResult = runSSHCommand("bash -lc 'module load \(mod) && conda create -n \(name) \(packageSpec) -y 2>&1'")
+                let createResult = runSSHCommand("bash -lc 'module load \(mod) && conda create -n \(name) \(packageSpec) -y 2>&1'",
+                    processCallback: { [self] p in currentProcess = p })
                 appendLog(createResult.output)
                 if createResult.success {
                     DispatchQueue.main.async {
@@ -3310,42 +3462,9 @@ struct CondaEnvSetupView: View {
         }
     }
     
-    private func parseLatestCondaModule(from output: String) -> String? {
-        let tokens = output.components(separatedBy: .whitespacesAndNewlines)
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "(D)")) }
-            .filter { !$0.isEmpty }
-        let pattern = #"^anaconda3/\d{4}\.\d{2}$"#
-        let versions = tokens.filter { $0.range(of: pattern, options: .regularExpression) != nil }
-        return versions.sorted().last
-    }
-    
     private func appendLog(_ text: String) {
         DispatchQueue.main.async {
             log += text
-        }
-    }
-    
-    private func runSSHCommand(_ command: String) -> (success: Bool, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = ["torch", command]
-        
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        
-        DispatchQueue.main.async { currentProcess = process }
-        
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            DispatchQueue.main.async { currentProcess = nil }
-            return (process.terminationStatus == 0, output)
-        } catch {
-            DispatchQueue.main.async { currentProcess = nil }
-            return (false, "Failed to run command: \(error.localizedDescription)")
         }
     }
     
