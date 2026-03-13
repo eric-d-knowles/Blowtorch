@@ -175,7 +175,7 @@ fi
 
 # Normalize IDE (tr for bash 3.2 compat on macOS)
 IDE=$(echo "$IDE" | tr '[:upper:]' '[:lower:]')
-if [[ "$IDE" != "positron" ]]; then
+if [[ "$IDE" != "positron" && "$IDE" != "none" ]]; then
     IDE="vscode"
 fi
 
@@ -356,17 +356,64 @@ ssh torch-compute "ls /scratch/\$USER > /dev/null 2>&1 || true" 2>/dev/null || t
 # =============================================================================
 # Step 7: Launch IDE
 # =============================================================================
+# --- Helper: find a CLI by name, checking PATH and common install locations ---
+_find_cli() {
+    local name="$1"
+    shift
+    # Check PATH first
+    if command -v "$name" >/dev/null 2>&1; then
+        echo "$(command -v "$name")"
+        return 0
+    fi
+    # Check each candidate path provided
+    for candidate in "$@"; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_install_cli_symlink() {
+    local name="$1"
+    local bundle_bin="$2"
+    local symlink_path="/usr/local/bin/$name"
+    if [[ -x "$bundle_bin" && ! -e "$symlink_path" ]]; then
+        echo "Installing '$name' CLI symlink to $symlink_path..."
+        ln -sf "$bundle_bin" "$symlink_path" 2>/dev/null || \
+            sudo ln -sf "$bundle_bin" "$symlink_path" 2>/dev/null || true
+    fi
+}
+
 _launch_vscode() {
     local uri="vscode-remote://ssh-remote+torch-compute${WORK_DIR}"
-    if command -v code >/dev/null 2>&1; then
+    
+    # Auto-install CLI symlink if app bundle exists but CLI is missing
+    for bundle in \
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+        "$HOME/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+    do
+        if [[ -x "$bundle" ]]; then
+            _install_cli_symlink "code" "$bundle"
+            break
+        fi
+    done
+    
+    local code_cli
+    code_cli=$(_find_cli code \
+        "/usr/local/bin/code" \
+        "/opt/homebrew/bin/code" \
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+        "$HOME/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+    if [[ -n "$code_cli" ]]; then
         echo -e "\033[1;32mLaunching VS Code...\033[0m"
-        code --folder-uri "$uri"
+        "$code_cli" --folder-uri "$uri"
     else
-        echo -e "\033[1;33m'code' CLI not found.\033[0m"
-        echo "Install it from VS Code: Command Palette → 'Shell Command: Install code command in PATH'"
-        echo "Or: brew install --cask visual-studio-code"
+        echo -e "\033[1;33mVS Code not found.\033[0m"
+        echo "Install VS Code: brew install --cask visual-studio-code"
         echo
-        echo "Then run:"
+        echo "To connect manually once installed:"
         echo "  code --folder-uri \"$uri\""
     fi
     echo -e "To reconnect: \033[1;33mcode --folder-uri \"$uri\"\033[0m"
@@ -374,16 +421,33 @@ _launch_vscode() {
 
 _launch_positron() {
     local uri="vscode-remote://ssh-remote+torch-compute${WORK_DIR}"
-    if command -v positron >/dev/null 2>&1; then
+    
+    # Auto-install CLI symlink if app bundle exists but CLI is missing
+    for bundle in \
+        "/Applications/Positron.app/Contents/Resources/app/bin/positron" \
+        "$HOME/Applications/Positron.app/Contents/Resources/app/bin/positron"
+    do
+        if [[ -x "$bundle" ]]; then
+            _install_cli_symlink "positron" "$bundle"
+            break
+        fi
+    done
+    
+    local positron_cli
+    positron_cli=$(_find_cli positron \
+        "/usr/local/bin/positron" \
+        "/opt/homebrew/bin/positron" \
+        "/Applications/Positron.app/Contents/Resources/app/bin/positron" \
+        "$HOME/Applications/Positron.app/Contents/Resources/app/bin/positron")
+    if [[ -n "$positron_cli" ]]; then
         echo -e "\033[1;32mLaunching Positron...\033[0m"
-        positron --folder-uri "$uri"
+        "$positron_cli" --folder-uri "$uri"
     else
-        echo -e "\033[1;33m'positron' CLI not found.\033[0m"
+        echo -e "\033[1;33mPositron not found.\033[0m"
         echo "Install Positron from: https://positron.posit.co/download.html"
-        echo "Then: Command Palette → 'Shell Command: Install positron command in PATH'"
         echo
         echo "To connect manually once Positron is open:"
-        echo "  Command Palette → Remote SSH: Show Remote Menu → Connect to Host → torch-compute"
+        echo "  Command Palette → Remote SSH: Connect to Host → torch-compute"
         echo "  Then open: $WORK_DIR"
     fi
     echo -e "To reconnect manually: open Positron → Remote Explorer → torch-compute"
@@ -391,6 +455,9 @@ _launch_positron() {
 
 if [[ "$IDE" == "positron" ]]; then
     _launch_positron
+elif [[ "$IDE" == "none" ]]; then
+    echo -e "\033[1;32mNode ready. No IDE launched.\033[0m"
+    echo "SSH host: torch-compute"
 else
     _launch_vscode
 fi

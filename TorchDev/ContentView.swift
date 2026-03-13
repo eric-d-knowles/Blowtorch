@@ -2035,6 +2035,7 @@ struct ContentView: View {
                     Picker("IDE", selection: $ide) {
                         Text("VS Code").tag("vscode")
                         Text("Positron").tag("positron")
+                        Text("None").tag("none")
                     }
                     .pickerStyle(.segmented)
                 }
