@@ -14,7 +14,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		100 /* TorchDev.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TorchDev.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100 /* Blowtorch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Blowtorch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		101 /* TorchDevApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorchDevApp.swift; sourceTree = "<group>"; };
 		102 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		103 /* torch-dev.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "torch-dev.sh"; sourceTree = "<group>"; };
@@ -56,7 +56,7 @@
 		302 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				100 /* TorchDev.app */,
+				100 /* Blowtorch.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -72,9 +72,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		400 /* TorchDev */ = {
+		400 /* Blowtorch */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 500 /* Build configuration list for PBXNativeTarget "TorchDev" */;
+			buildConfigurationList = 500 /* Build configuration list for PBXNativeTarget "Blowtorch" */;
 			buildPhases = (
 				401 /* Sources */,
 				200 /* Frameworks */,
@@ -84,9 +84,9 @@
 			);
 			dependencies = (
 			);
-			name = TorchDev;
+			name = Blowtorch;
 			productName = TorchDev;
-			productReference = 100 /* TorchDev.app */;
+			productReference = 100 /* Blowtorch.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -104,7 +104,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 601 /* Build configuration list for PBXProject "TorchDev" */;
+			buildConfigurationList = 601 /* Build configuration list for PBXProject "Blowtorch" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -117,7 +117,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				400 /* TorchDev */,
+				400 /* Blowtorch */,
 			);
 		};
 /* End PBXProject section */
@@ -281,6 +281,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = JY3R7SKYYY;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -322,6 +323,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "";
+				DEVELOPMENT_TEAM = JY3R7SKYYY;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -354,7 +356,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		500 /* Build configuration list for PBXNativeTarget "TorchDev" */ = {
+		500 /* Build configuration list for PBXNativeTarget "Blowtorch" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				702 /* Debug */,
@@ -363,7 +365,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		601 /* Build configuration list for PBXProject "TorchDev" */ = {
+		601 /* Build configuration list for PBXProject "Blowtorch" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				700 /* Debug */,
