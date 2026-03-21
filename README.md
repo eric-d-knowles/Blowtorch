@@ -1,8 +1,8 @@
-# Torch Dev
+# Blowtorch
 
 A macOS app for connecting to the [NYU Torch HPC cluster](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/torch). It handles authentication, job submission, tunnel setup, and IDE launch — all from a single window.
 
-<img src="https://github.com/eric-d-knowles/TorchDev/blob/main/TorchDev/Assets.xcassets/AppIcon.appiconset/blowtorch_icon.png?raw=true" width="128" alt="Torch Dev icon">
+<img src="https://github.com/eric-d-knowles/Blowtorch/blob/main/Blowtorch/Assets.xcassets/AppIcon.appiconset/blowtorch_icon.png?raw=true" width="128" alt="Torch Dev icon">
 
 ---
 
@@ -28,7 +28,7 @@ A macOS app for connecting to the [NYU Torch HPC cluster](https://sites.google.c
 
 ## Installation
 
-Download the latest release from the [Releases](../../releases) page, unzip, and move `TorchDev.app` to your Applications folder.
+Download the latest release from the [Releases](../../releases) page, unzip, and move `Blowtorch.app` to your Applications folder.
 
 > **Note:** Because this app is not yet notarized, macOS may show a security warning on first launch. To open it, right-click the app and choose **Open**, then click **Open Anyway**. You only need to do this once.
 
@@ -74,9 +74,9 @@ If authentication is required, the app will display your device code PIN and ope
 ## Building from Source
 
 ```bash
-git clone https://github.com/eric-d-knowles/TorchDev.git
-cd TorchDev
-open TorchDev.xcodeproj
+git clone https://github.com/eric-d-knowles/Blowtorch.git
+cd Blowtorch
+open Blowtorch.xcodeproj
 ```
 
 Build and run with Xcode (⌘R). The bundled `torch-dev.sh` shell script must be included in the app target's **Copy Bundle Resources** build phase.
