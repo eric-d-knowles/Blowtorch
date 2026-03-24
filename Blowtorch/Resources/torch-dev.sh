@@ -380,9 +380,7 @@ _install_cli_symlink() {
     local bundle_bin="$2"
     local symlink_path="/usr/local/bin/$name"
     if [[ -x "$bundle_bin" && ! -e "$symlink_path" ]]; then
-        echo "Installing '$name' CLI symlink to $symlink_path..."
-        ln -sf "$bundle_bin" "$symlink_path" 2>/dev/null || \
-            sudo ln -sf "$bundle_bin" "$symlink_path" 2>/dev/null || true
+        ln -sf "$bundle_bin" "$symlink_path" 2>/dev/null || true
     fi
 }
 
