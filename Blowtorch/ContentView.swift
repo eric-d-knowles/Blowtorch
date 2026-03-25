@@ -2074,6 +2074,8 @@ struct ContentView: View {
     @State private var showingCondaEnvSetup = false
     @State private var showingSetupAlert = false
     @State private var setupAlertMessage = ""
+    @State private var isCancellingJob = false
+    @State private var isResettingSSH = false
     
     @StateObject private var connectionManager = ConnectionManager()
     @StateObject private var sshConfigManager = SSHConfigManager()
@@ -2252,6 +2254,50 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .disabled(!sshConfigManager.isConfigured)
                 }
+                
+                Section("Manage") {
+                    Button(action: cancelExistingJobs) {
+                        HStack {
+                            if isCancellingJob {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "xmark.circle")
+                                    .foregroundStyle(.red)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Cancel Jobs")
+                                Text("Cancel all your torchdev jobs")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!sshConfigManager.isConfigured || isCancellingJob)
+                    
+                    Button(action: resetSSHConnection) {
+                        HStack {
+                            if isResettingSSH {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .foregroundStyle(.orange)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Reset SSH Connection")
+                                Text("Tear down ControlMaster session")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isResettingSSH)
+                }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
@@ -2322,6 +2368,48 @@ struct ContentView: View {
     
     private func setupRemoteServers() {
         showingRemoteSetup = true
+    }
+    
+    private func cancelExistingJobs() {
+        isCancellingJob = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runSSHCommand("scancel -u $USER --name=torchdev 2>/dev/null; echo done")
+            DispatchQueue.main.async {
+                isCancellingJob = false
+                if result.success {
+                    setupAlertMessage = "All torchdev jobs have been cancelled."
+                } else {
+                    setupAlertMessage = "Failed to cancel jobs: \(result.output)"
+                }
+                showingSetupAlert = true
+            }
+        }
+    }
+    
+    private func resetSSHConnection() {
+        isResettingSSH = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.arguments = ["-O", "exit", "torch"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            try? process.run()
+            process.waitUntilExit()
+            
+            // Also clean up tunnel pid/port files
+            let configDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/torch")
+            try? FileManager.default.removeItem(at: configDir.appendingPathComponent("tunnel.pid"))
+            try? FileManager.default.removeItem(at: configDir.appendingPathComponent("tunnel.port"))
+            
+            DispatchQueue.main.async {
+                isResettingSSH = false
+                setupAlertMessage = "SSH ControlMaster session has been reset."
+                showingSetupAlert = true
+            }
+        }
     }
 }
 
