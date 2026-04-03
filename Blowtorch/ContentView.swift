@@ -3094,7 +3094,7 @@ struct CondaEnvSetupView: View {
     @State private var selectedVersion: String = ""
     @State private var projectFolder: String = ""
     
-    // Available versions (fetched via conda search)
+    // Available versions shown in the picker.
     @State private var availableVersions: [String] = []
     @State private var isLoadingVersions = true
     @State private var versionError: String = ""
@@ -3200,7 +3200,7 @@ struct CondaEnvSetupView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Button("Retry") { fetchVersions() }
+                            Button("Retry") { discoverCondaModule() }
                                 .font(.caption)
                         } else if !availableVersions.isEmpty {
                             Picker("Version", selection: $selectedVersion) {
@@ -3369,68 +3369,55 @@ struct CondaEnvSetupView: View {
         }
     }
     
+    private func commonVersions(for language: Language) -> [String] {
+        switch language {
+        case .python:
+            return ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8"]
+        case .r:
+            return ["4.4", "4.3", "4.2", "4.1", "4.0"]
+        }
+    }
+
+    private func nearestSupportedVersion(to requestedVersion: String, for language: Language) -> String? {
+        let available = commonVersions(for: language)
+        return available.first { $0.compare(requestedVersion, options: .numeric) != .orderedDescending }
+            ?? available.last
+    }
+
+    private func createEnvironmentErrorMessage(for language: Language, version: String, output: String) -> String {
+        let loweredOutput = output.lowercased()
+        let packageName = language == .python ? "python" : "r-base"
+
+        if loweredOutput.contains("packagesnotfounderror")
+            || loweredOutput.contains("nothing provides requested")
+            || loweredOutput.contains("resolvepackagenotfound")
+            || loweredOutput.contains("could not find") && loweredOutput.contains(packageName) {
+            if let fallback = nearestSupportedVersion(to: version, for: language), fallback != version {
+                return "\(language.rawValue) \(version) is not available on this cluster. Try \(fallback)."
+            }
+            return "\(language.rawValue) \(version) is not available on this cluster."
+        }
+
+        if loweredOutput.contains("unsatisfiableerror") {
+            if let fallback = nearestSupportedVersion(to: version, for: language), fallback != version {
+                return "Could not resolve \(language.rawValue) \(version). Try \(fallback)."
+            }
+            return "Could not resolve \(language.rawValue) \(version) in conda."
+        }
+
+        return "Failed to create environment."
+    }
+
     private func fetchVersions() {
         isLoadingVersions = true
         versionError = ""
         availableVersions = []
         selectedVersion = ""
-        
-        let mod = condaModule
-        guard !mod.isEmpty else {
-            versionError = "Conda module not yet discovered."
-            isLoadingVersions = false
-            return
-        }
-        
-        let lang = language
-        // Use conda search with a version filter to limit output size
-        let searchExpr = lang == .python ? "\"python>=3.8\"" : "\"r-base>=4.0\""
-        let packageName = lang == .python ? "python" : "r-base"
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Use plain-text output (much smaller than JSON) and extract version column
-            let result = runSSHCommand("bash -lc 'module load \(mod) 2>/dev/null && conda search \(searchExpr) 2>/dev/null'")
-            
-            if result.success {
-                // Plain-text output has lines like:
-                //   python   3.11.5   h7a1cb2a_0   conda-forge
-                // First line(s) may be headers. Extract version from column 2.
-                var versionSet = Set<String>()
-                let lines = result.output.components(separatedBy: .newlines)
-                for line in lines {
-                    let cols = line.split(separator: " ", omittingEmptySubsequences: true)
-                            .map { String($0).trimmingCharacters(in: .whitespaces) }
-                    // Expect: name version build channel
-                    guard cols.count >= 3,
-                          cols[0] == packageName else { continue }
-                    let ver = cols[1]
-                    let parts = ver.split(separator: ".")
-                    if parts.count >= 2 {
-                        let majorMinor = "\(parts[0]).\(parts[1])"
-                        versionSet.insert(majorMinor)
-                    }
-                }
-                
-                if !versionSet.isEmpty {
-                    let sorted = versionSet.sorted { v1, v2 in
-                        v1.compare(v2, options: .numeric) == .orderedAscending
-                    }.reversed().map { String($0) }
-                    
-                    DispatchQueue.main.async {
-                        availableVersions = Array(sorted)
-                        selectedVersion = availableVersions.first ?? ""
-                        isLoadingVersions = false
-                    }
-                    return
-                }
-            }
-            
-            appendLog("Version fetch failed. Output:\n\(result.output.prefix(500))\n")
-            DispatchQueue.main.async {
-                versionError = "Could not fetch available versions."
-                isLoadingVersions = false
-            }
-        }
+
+        let versions = commonVersions(for: language)
+        availableVersions = versions
+        selectedVersion = versions.first ?? ""
+        isLoadingVersions = false
     }
     
     // MARK: - Setup Logic
@@ -3477,9 +3464,10 @@ struct CondaEnvSetupView: View {
                         createEnvStatus = .ok
                     }
                 } else {
+                    let createError = createEnvironmentErrorMessage(for: lang, version: ver, output: createResult.output)
                     DispatchQueue.main.async {
                         createEnvStatus = .error
-                        errorMessage = "Failed to create environment."
+                        errorMessage = createError
                         isRunning = false
                     }
                     // Clean up the partial env
