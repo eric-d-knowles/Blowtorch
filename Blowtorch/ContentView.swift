@@ -75,6 +75,44 @@ struct ClusterPartitionInfo: Identifiable {
     let pendingJobs: Int
 }
 
+// MARK: - Resource Usage Model
+struct ResourceUsage {
+    let memoryCurrentBytes: Int64
+    let memoryMaxBytes: Int64
+    let cpuUsageUsec: Int64
+    let cpuUserUsec: Int64
+    let cpuSystemUsec: Int64
+    let nrThrottled: Int64
+
+    var memoryCurrentFormatted: String {
+        ByteCountFormatter.string(fromByteCount: memoryCurrentBytes, countStyle: .memory)
+    }
+
+    var memoryMaxFormatted: String {
+        if memoryMaxBytes == Int64.max { return "Unlimited" }
+        return ByteCountFormatter.string(fromByteCount: memoryMaxBytes, countStyle: .memory)
+    }
+
+    var memoryUsageFraction: Double {
+        guard memoryMaxBytes > 0, memoryMaxBytes != Int64.max else { return 0 }
+        return Double(memoryCurrentBytes) / Double(memoryMaxBytes)
+    }
+
+    var cpuUsageFormatted: String { formatUsec(cpuUsageUsec) }
+    var cpuUserFormatted: String { formatUsec(cpuUserUsec) }
+    var cpuSystemFormatted: String { formatUsec(cpuSystemUsec) }
+
+    private func formatUsec(_ usec: Int64) -> String {
+        let seconds = usec / 1_000_000
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        let secs = seconds % 60
+        if hours > 0 { return String(format: "%dh %02dm %02ds", hours, minutes, secs) }
+        if minutes > 0 { return String(format: "%dm %02ds", minutes, secs) }
+        return String(format: "%ds", secs)
+    }
+}
+
 // MARK: - SSH Auth Manager
 // Shared authentication helper. Establishes a ControlMaster session to the
 // torch login node, surfacing the browser PIN and URL for the UI to display.
@@ -358,8 +396,18 @@ class ConnectionManager: ObservableObject {
     @Published var showingQueueStatus = false
     @Published var clusterLoad: [ClusterPartitionInfo] = []
     @Published var showingClusterLoad = false
-    
-    private var currentJobId: String?
+    @Published var resourceUsage: ResourceUsage?
+    @Published var showingResourceUsage = false
+    @Published var isLoadingResourceUsage = false
+    @Published var resourceUsageError: String?
+    @Published var jobId: String?
+    @Published var nodeName: String?
+    @Published var jobPartition: String = ""
+    @Published var jobCPUs: Int = 0
+    @Published var jobRAM: Int = 0
+    @Published var jobGPU: Bool = false
+    @Published var jobHours: Int = 0
+
     private var process: Process?
     private var inputPipe: Pipe?
     
@@ -380,7 +428,16 @@ class ConnectionManager: ObservableObject {
         completedSuccessfully = false
         failed = false
         isWaitingForNode = false
-        currentJobId = nil
+        jobId = nil
+        nodeName = nil
+        jobPartition = partition
+        jobCPUs = cpus
+        jobRAM = ram
+        jobGPU = gpu
+        jobHours = hours
+        resourceUsage = nil
+        resourceUsageError = nil
+        isLoadingResourceUsage = false
         
         // Clean up any stale trigger file from previous runs
         let configDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/torch")
@@ -474,12 +531,12 @@ class ConnectionManager: ObservableObject {
         appendLog("\n— Cancelled —")
         
         // Cancel the Slurm job if one was submitted
-        if let jobId = currentJobId {
+        if let id = jobId {
             let scancelProcess = Process()
             scancelProcess.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            scancelProcess.arguments = ["torch", "scancel \(jobId) 2>/dev/null || true"]
+            scancelProcess.arguments = ["torch", "scancel \(id) 2>/dev/null || true"]
             try? scancelProcess.run()
-            currentJobId = nil
+            jobId = nil
         }
     }
     
@@ -706,6 +763,102 @@ class ConnectionManager: ObservableObject {
         self.clusterLoad = partitions
     }
     
+    func checkResourceUsage() {
+        guard let jobId = jobId else {
+            resourceUsageError = "No job ID available"
+            showingResourceUsage = true
+            return
+        }
+
+        isLoadingResourceUsage = true
+        resourceUsageError = nil
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        // Dynamically locate the cgroup directory for this job (path varies by node configuration)
+        process.arguments = ["torch-compute", """
+            CGROUP=$(find /sys/fs/cgroup -type d -name "job_\(jobId)" 2>/dev/null | head -1) && \
+            if [ -z "$CGROUP" ]; then echo "CGROUP_NOT_FOUND"; exit 1; fi && \
+            echo "=== MEMORY ===" && cat "$CGROUP/memory.current" 2>/dev/null && \
+            echo "=== MEMORY_MAX ===" && cat "$CGROUP/memory.max" 2>/dev/null && \
+            echo "=== CPU ===" && cat "$CGROUP/cpu.stat" 2>/dev/null
+            """]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        process.terminationHandler = { [weak self] proc in
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                self?.isLoadingResourceUsage = false
+                if output.contains("CGROUP_NOT_FOUND") {
+                    self?.resourceUsageError = "Could not find cgroup directory for job \(jobId)."
+                } else if proc.terminationStatus == 0 {
+                    self?.parseResourceUsage(output)
+                } else {
+                    self?.resourceUsageError = "Failed to read resource usage from compute node."
+                }
+                self?.showingResourceUsage = true
+            }
+        }
+
+        try? process.run()
+    }
+
+    private func parseResourceUsage(_ output: String) {
+        let lines = output.components(separatedBy: .newlines)
+        var memoryCurrent: Int64 = 0
+        var memoryMax: Int64 = 0
+        var cpuUsage: Int64 = 0
+        var cpuUser: Int64 = 0
+        var cpuSystem: Int64 = 0
+        var nrThrottled: Int64 = 0
+
+        var section = ""
+        for line in lines {
+            if line.contains("=== MEMORY ===") { section = "memory"; continue }
+            if line.contains("=== MEMORY_MAX ===") { section = "memory_max"; continue }
+            if line.contains("=== CPU ===") { section = "cpu"; continue }
+
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            switch section {
+            case "memory":
+                if let val = Int64(trimmed) { memoryCurrent = val }
+            case "memory_max":
+                if trimmed == "max" {
+                    memoryMax = Int64.max
+                } else if let val = Int64(trimmed) {
+                    memoryMax = val
+                }
+            case "cpu":
+                let parts = trimmed.components(separatedBy: .whitespaces)
+                if parts.count >= 2, let val = Int64(parts[1]) {
+                    switch parts[0] {
+                    case "usage_usec":   cpuUsage = val
+                    case "user_usec":    cpuUser = val
+                    case "system_usec":  cpuSystem = val
+                    case "nr_throttled": nrThrottled = val
+                    default: break
+                    }
+                }
+            default: break
+            }
+        }
+
+        resourceUsage = ResourceUsage(
+            memoryCurrentBytes: memoryCurrent,
+            memoryMaxBytes: memoryMax,
+            cpuUsageUsec: cpuUsage,
+            cpuUserUsec: cpuUser,
+            cpuSystemUsec: cpuSystem,
+            nrThrottled: nrThrottled
+        )
+    }
+
     private func appendLog(_ text: String) {
         // Strip ANSI escape codes for clean display
         let stripped = text.replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
@@ -762,7 +915,7 @@ class ConnectionManager: ObservableObject {
             // Job submitted
             if line.contains("Submitted job") {
                 if let jobId = line.components(separatedBy: " ").last?.trimmingCharacters(in: .whitespacesAndNewlines), !jobId.isEmpty {
-                    currentJobId = jobId
+                    self.jobId = jobId
                     updateStep("submit", status: .success, detail: "Job \(jobId)")
                 }
                 updateStep("allocate", status: .inProgress)
@@ -782,6 +935,7 @@ class ConnectionManager: ObservableObject {
                     .trimmingCharacters(in: .whitespaces)
                     .replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
                 updateStep("allocate", status: .success, detail: node)
+                nodeName = node
                 updateStep("tunnel", status: .inProgress)
             }
             
@@ -1155,8 +1309,8 @@ struct ConnectionProgressView: View {
                         manager.cancel()
                     }
                     .keyboardShortcut(.cancelAction)
-                } else {
-                    Button(manager.completedSuccessfully ? "Done" : "Close") {
+                } else if manager.failed {
+                    Button("Close") {
                         dismiss()
                     }
                     .keyboardShortcut(.defaultAction)
@@ -1168,6 +1322,13 @@ struct ConnectionProgressView: View {
         .animation(.easeInOut(duration: 0.2), value: manager.authRequired)
         .animation(.easeInOut(duration: 0.2), value: showLog)
         .animation(.easeInOut(duration: 0.2), value: detailCount)
+        .onChange(of: manager.completedSuccessfully) { completed in
+            if completed {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    dismiss()
+                }
+            }
+        }
         .sheet(isPresented: $manager.showingQueueStatus) {
             QueueStatusView(jobs: manager.queueJobs, isPresented: $manager.showingQueueStatus)
         }
@@ -1527,6 +1688,414 @@ struct ClusterLoadView: View {
         }
         .padding(20)
         .frame(width: 420, height: 450)
+    }
+}
+
+// MARK: - Resource Usage View
+struct ResourceUsageView: View {
+    let usage: ResourceUsage?
+    let error: String?
+    @Binding var isPresented: Bool
+    let onRefresh: () -> Void
+
+    private let refreshInterval: TimeInterval = 60
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    @State private var secondsUntilRefresh: Int = 60
+
+    var body: some View {
+        VStack(spacing: 16) {
+            // Header
+            HStack {
+                Image(systemName: "memorychip")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                Text("Resource Usage")
+                    .font(.headline)
+                Spacer()
+                Text("Refreshing in \(secondsUntilRefresh)s")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .onReceive(timer) { _ in
+                secondsUntilRefresh -= 1
+                if secondsUntilRefresh <= 0 {
+                    secondsUntilRefresh = Int(refreshInterval)
+                    onRefresh()
+                }
+            }
+
+            Divider()
+
+            if let error = error {
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text(error)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxHeight: .infinity)
+            } else if let usage = usage {
+                // Memory section
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Memory")
+                            .font(.headline)
+
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Used")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.memoryCurrentFormatted)
+                                    .font(.system(.title3, design: .monospaced).bold())
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Limit")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.memoryMaxFormatted)
+                                    .font(.system(.title3, design: .monospaced).bold())
+                            }
+
+                            Spacer()
+
+                            if usage.memoryMaxBytes != Int64.max && usage.memoryMaxBytes > 0 {
+                                Text(String(format: "%.1f%%", usage.memoryUsageFraction * 100))
+                                    .font(.system(.title3, design: .monospaced))
+                                    .foregroundStyle(
+                                        usage.memoryUsageFraction > 0.9 ? .red :
+                                        usage.memoryUsageFraction > 0.7 ? .orange : .green
+                                    )
+                            }
+                        }
+
+                        if usage.memoryMaxBytes != Int64.max && usage.memoryMaxBytes > 0 {
+                            GeometryReader { geo in
+                                let fraction = CGFloat(usage.memoryUsageFraction)
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(.gray.opacity(0.2))
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(fraction > 0.9 ? Color.red : fraction > 0.7 ? Color.orange : Color.green)
+                                        .frame(width: geo.size.width * fraction)
+                                }
+                            }
+                            .frame(height: 6)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                // CPU section
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("CPU Time")
+                            .font(.headline)
+
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Total")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuUsageFormatted)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("User")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuUserFormatted)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("System")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuSystemFormatted)
+                                    .font(.system(.body, design: .monospaced))
+                            }
+
+                            Spacer()
+                        }
+
+                        if usage.nrThrottled > 0 {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                                    .font(.caption)
+                                Text("CPU throttled \(usage.nrThrottled) time\(usage.nrThrottled == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "memorychip")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("No resource data available")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxHeight: .infinity)
+            }
+
+            Spacer()
+
+            Button("Done") {
+                isPresented = false
+            }
+            .keyboardShortcut(.defaultAction)
+        }
+        .padding(20)
+        .frame(width: 420, height: 380)
+    }
+}
+
+// MARK: - Session Sheet View
+struct SessionSheetView: View {
+    @ObservedObject var manager: ConnectionManager
+    @Binding var isPresented: Bool
+
+    @State private var secondsUntilRefresh: Int = 60
+    @State private var isCancellingJob = false
+    @State private var showCancelConfirmation = false
+    @State private var jobCancelled = false
+
+    private let refreshInterval = 60
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 16) {
+            // Header
+            HStack {
+                Image(systemName: "server.rack")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+                Text("Active Session")
+                    .font(.headline)
+                Spacer()
+                if let jobId = manager.jobId {
+                    Text("Job \(jobId)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            // Job details
+            GroupBox {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Job Details")
+                        .font(.headline)
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                        GridItem(.flexible())
+                    ], spacing: 8) {
+                        InfoCell(label: "Partition",
+                                 value: manager.jobPartition.isEmpty ? "default" : manager.jobPartition)
+                        InfoCell(label: "CPUs", value: "\(manager.jobCPUs)")
+                        InfoCell(label: "RAM", value: "\(manager.jobRAM) GB")
+                        InfoCell(label: "GPU", value: manager.jobGPU ? "Yes" : "No")
+                        InfoCell(label: "Wall Time", value: "\(manager.jobHours)h")
+                        InfoCell(label: "Node", value: manager.nodeName ?? "—")
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            // Resource usage
+            GroupBox {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Resource Usage")
+                            .font(.headline)
+                        Spacer()
+                        if !jobCancelled {
+                            Text("Refreshing in \(secondsUntilRefresh)s")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+
+                    if manager.isLoadingResourceUsage {
+                        HStack(spacing: 8) {
+                            ProgressView().scaleEffect(0.7)
+                            Text("Loading...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let error = manager.resourceUsageError {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                                .font(.caption)
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let usage = manager.resourceUsage {
+                        // Memory
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Memory Used")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.memoryCurrentFormatted)
+                                    .font(.system(.body, design: .monospaced).bold())
+                            }
+                            if usage.memoryMaxBytes != Int64.max && usage.memoryMaxBytes > 0 {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Limit")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(usage.memoryMaxFormatted)
+                                        .font(.system(.body, design: .monospaced))
+                                }
+                                Spacer()
+                                Text(String(format: "%.1f%%", usage.memoryUsageFraction * 100))
+                                    .font(.system(.body, design: .monospaced))
+                                    .foregroundStyle(
+                                        usage.memoryUsageFraction > 0.9 ? .red :
+                                        usage.memoryUsageFraction > 0.7 ? .orange : .green
+                                    )
+                            } else {
+                                Spacer()
+                            }
+                        }
+                        if usage.memoryMaxBytes != Int64.max && usage.memoryMaxBytes > 0 {
+                            GeometryReader { geo in
+                                let fraction = CGFloat(usage.memoryUsageFraction)
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 3).fill(.gray.opacity(0.2))
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(fraction > 0.9 ? Color.red : fraction > 0.7 ? Color.orange : Color.green)
+                                        .frame(width: geo.size.width * fraction)
+                                }
+                            }
+                            .frame(height: 6)
+                        }
+
+                        Divider()
+
+                        // CPU
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("CPU Total")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuUsageFormatted)
+                                    .font(.system(.caption, design: .monospaced))
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("User")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuUserFormatted)
+                                    .font(.system(.caption, design: .monospaced))
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("System")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(usage.cpuSystemFormatted)
+                                    .font(.system(.caption, design: .monospaced))
+                            }
+                            Spacer()
+                        }
+                        if usage.nrThrottled > 0 {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                                    .font(.caption)
+                                Text("CPU throttled \(usage.nrThrottled) time\(usage.nrThrottled == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    } else {
+                        Text("Loading resource data...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .onReceive(timer) { _ in
+                guard !jobCancelled else { return }
+                secondsUntilRefresh -= 1
+                if secondsUntilRefresh <= 0 {
+                    secondsUntilRefresh = refreshInterval
+                    manager.checkResourceUsage()
+                }
+            }
+
+            Spacer()
+
+            // Buttons
+            HStack {
+                Button(role: .destructive, action: { showCancelConfirmation = true }) {
+                    HStack {
+                        if isCancellingJob {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "xmark.circle")
+                        }
+                        Text(jobCancelled ? "Job Cancelled" : "Cancel Job")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isCancellingJob || jobCancelled || manager.jobId == nil)
+
+                Spacer()
+
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 440, height: 520)
+        .onAppear {
+            manager.checkResourceUsage()
+        }
+        .alert("Cancel Job?", isPresented: $showCancelConfirmation) {
+            Button("Cancel Job", role: .destructive) { cancelJob() }
+            Button("Keep Running", role: .cancel) { }
+        } message: {
+            if let jobId = manager.jobId {
+                Text("This will cancel job \(jobId) on the cluster. This cannot be undone.")
+            } else {
+                Text("This will cancel the job on the cluster. This cannot be undone.")
+            }
+        }
+    }
+
+    private func cancelJob() {
+        guard let jobId = manager.jobId else { return }
+        isCancellingJob = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = runSSHCommand("scancel \(jobId) 2>/dev/null; echo done")
+            DispatchQueue.main.async {
+                isCancellingJob = false
+                if result.success {
+                    jobCancelled = true
+                }
+            }
+        }
     }
 }
 
@@ -2067,6 +2636,7 @@ struct ContentView: View {
     @AppStorage("ide") private var ide = "vscode"
     
     @State private var showingProgress = false
+    @State private var showingSession = false
     @State private var showingSSHSetup = false
     @State private var showingSSHTroubleshoot = false
     @State private var showingRemoteSetup = false
@@ -2256,6 +2826,25 @@ struct ContentView: View {
                 }
                 
                 Section("Manage") {
+                    if connectionManager.completedSuccessfully && connectionManager.jobId != nil {
+                        Button(action: { showingSession = true }) {
+                            HStack {
+                                Image(systemName: "play.circle.fill")
+                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Active Session")
+                                    Text("Job \(connectionManager.jobId ?? "") on \(connectionManager.nodeName ?? "node")")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
                     Button(action: cancelExistingJobs) {
                         HStack {
                             if isCancellingJob {
@@ -2318,8 +2907,17 @@ struct ContentView: View {
         }
         .frame(width: 340, height: 680)
         .background(.background)
-        .sheet(isPresented: $showingProgress) {
+        .sheet(isPresented: $showingProgress, onDismiss: {
+            if connectionManager.completedSuccessfully {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    showingSession = true
+                }
+            }
+        }) {
             ConnectionProgressView(manager: connectionManager)
+        }
+        .sheet(isPresented: $showingSession) {
+            SessionSheetView(manager: connectionManager, isPresented: $showingSession)
         }
         .sheet(isPresented: $showingSSHSetup) {
             SSHSetupView(configManager: sshConfigManager)
