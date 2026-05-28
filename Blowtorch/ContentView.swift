@@ -345,7 +345,11 @@ struct SSHAuthCardView: View {
 func runSSHCommand(_ command: String, processCallback: ((Process?) -> Void)? = nil) -> (success: Bool, output: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-    process.arguments = ["torch", command]
+    process.arguments = [
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=10",
+        "torch", command
+    ]
 
     let pipe = Pipe()
     process.standardOutput = pipe
@@ -357,8 +361,11 @@ func runSSHCommand(_ command: String, processCallback: ((Process?) -> Void)? = n
 
     do {
         try process.run()
-        process.waitUntilExit()
+        // Read output before waitUntilExit to avoid pipe buffer deadlock.
+        // If the process produces >64KB of output, waitUntilExit blocks
+        // because the pipe is full and the process can't write more.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
         if let cb = processCallback {
             DispatchQueue.main.async { cb(nil) }
@@ -370,6 +377,27 @@ func runSSHCommand(_ command: String, processCallback: ((Process?) -> Void)? = n
         }
         return (false, error.localizedDescription)
     }
+}
+
+/// Removes the conda Machine settings and terminal init script from the cluster.
+/// Uses the login node since $HOME is shared across all nodes.
+/// Safe to call when no settings exist — rm -f is a no-op.
+func cleanupCondaBlock() {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+    process.arguments = [
+        "-o", "ConnectTimeout=3",
+        "-o", "ConnectionAttempts=1",
+        "torch",
+        "rm -f ~/.vscode-server/data/Machine/settings.json 2>/dev/null; " +
+        "rm -f ~/.positron-server/data/Machine/settings.json 2>/dev/null; " +
+        "rm -f /tmp/torch-conda-init.sh 2>/dev/null; " +
+        "echo done"
+    ]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try? process.run()
+    process.waitUntilExit()
 }
 
 /// Parses `module avail conda` output and returns the latest anaconda3/YYYY.MM module name.
@@ -412,16 +440,20 @@ class ConnectionManager: ObservableObject {
     private var process: Process?
     private var inputPipe: Pipe?
     
-    func start(account: String, hours: Int, partition: String, cpus: Int, ram: Int, gpu: Bool, project: String, ide: String) {
+    func start(account: String, hours: Int, partition: String, cpus: Int, ram: Int, gpu: Bool, project: String, ide: String, condaEnv: String) {
         // Reset state
-        steps = [
+        var stepList = [
             ConnectionStep(id: "auth", label: "Authenticating"),
             ConnectionStep(id: "submit", label: "Submitting job"),
             ConnectionStep(id: "allocate", label: "Waiting for compute node"),
             ConnectionStep(id: "tunnel", label: "Starting tunnel"),
             ConnectionStep(id: "ssh", label: "Connecting to node"),
-            ConnectionStep(id: "ide", label: "Launching \(ide == "positron" ? "Positron" : "VS Code")")
         ]
+        if !condaEnv.isEmpty {
+            stepList.append(ConnectionStep(id: "conda", label: "Configuring \(condaEnv)"))
+        }
+        stepList.append(ConnectionStep(id: "ide", label: "Launching \(ide == "positron" ? "Positron" : "VS Code")"))
+        steps = stepList
         logOutput = ""
         isRunning = true
         authRequired = false
@@ -466,6 +498,7 @@ class ConnectionManager: ObservableObject {
         export TORCH_GPU="\(gpuValue)"
         export TORCH_PROJECT="\(project)"
         export TORCH_IDE="\(ide)"
+        export TORCH_CONDA_ENV="\(condaEnv)"
         export TORCH_SKIP_PROMPTS="1"
         source "\(scriptURL.path)"
         """
@@ -535,9 +568,14 @@ class ConnectionManager: ObservableObject {
         if let id = jobId {
             let scancelProcess = Process()
             scancelProcess.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            scancelProcess.arguments = ["torch", "scancel \(id) 2>/dev/null || true"]
+            scancelProcess.arguments = ["torch", "bash -lc 'scancel \(id) 2>/dev/null || true'"]
             try? scancelProcess.run()
             jobId = nil
+        }
+        
+        // Clean up conda activation block from shell init files
+        DispatchQueue.global(qos: .utility).async {
+            cleanupCondaBlock()
         }
     }
     
@@ -562,10 +600,10 @@ class ConnectionManager: ObservableObject {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // Get detailed job info in a parseable format
         process.arguments = ["torch", """
-            echo "=== SQUEUE ===" && \
-            squeue -u $USER -o '%i|%P|%j|%T|%M|%l|%D|%C|%m|%r|%S' 2>/dev/null && \
+            bash -lc 'echo "=== SQUEUE ===" && \
+            squeue -u $USER -o "%i|%P|%j|%T|%M|%l|%D|%C|%m|%r|%S" 2>/dev/null && \
             echo "=== SPRIO ===" && \
-            sprio -u $USER -o '%i|%Y|%A|%F|%J|%P|%Q' 2>/dev/null
+            sprio -u $USER -o "%i|%Y|%A|%F|%J|%P|%Q" 2>/dev/null'
             """]
         
         let pipe = Pipe()
@@ -657,10 +695,10 @@ class ConnectionManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = ["torch", """
-            echo "=== SINFO ===" && \
-            sinfo -o '%P|%a|%D|%A|%C' --noheader 2>/dev/null && \
+            bash -lc 'echo "=== SINFO ===" && \
+            sinfo -o "%P|%a|%D|%A|%C" --noheader 2>/dev/null && \
             echo "=== SQUEUE_SUMMARY ===" && \
-            squeue -o '%T' --noheader 2>/dev/null | sort | uniq -c
+            squeue -o "%T" --noheader 2>/dev/null | sort | uniq -c'
             """]
         
         let pipe = Pipe()
@@ -956,9 +994,25 @@ class ConnectionManager: ObservableObject {
                 updateStep("ssh", status: .inProgress)
             }
             
+            // Conda environment activation
+            if line.contains("Activating conda environment") {
+                updateStep("ssh", status: .success)
+                updateStep("conda", status: .inProgress)
+            }
+            if line.contains("Conda environment configured:") {
+                updateStep("conda", status: .success)
+            }
+            if line.contains("Could not locate conda") || line.contains("failed to write conda settings") {
+                updateStep("conda", status: .failed)
+            }
+            
             // Launching IDE or CLI not found (connection succeeded either way)
             if line.contains("Launching VS Code") || line.contains("Launching Positron") {
                 updateStep("ssh", status: .success)
+                // Mark conda as success if it was in progress (shouldn't happen but be safe)
+                if let idx = steps.firstIndex(where: { $0.id == "conda" }), steps[idx].status == .inProgress {
+                    updateStep("conda", status: .success)
+                }
                 updateStep("ide", status: .success)
             }
             
@@ -2089,7 +2143,9 @@ struct SessionSheetView: View {
         guard let jobId = manager.jobId else { return }
         isCancellingJob = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = runSSHCommand("scancel \(jobId) 2>/dev/null; echo done")
+            let result = runSSHCommand("bash -lc 'scancel \(jobId) 2>/dev/null'; echo done")
+            // Clean up conda activation block from shell init files
+            cleanupCondaBlock()
             DispatchQueue.main.async {
                 isCancellingJob = false
                 if result.success {
@@ -2376,15 +2432,29 @@ struct SSHTroubleshootView: View {
             }
             
             // Check 3: Key on server (only if key exists)
+            // Read the local public key and check if it's actually in
+            // ~/.ssh/authorized_keys on the cluster. A plain "ssh torch echo ok"
+            // is unreliable because ControlMaster reuses a password-authenticated
+            // session, masking a missing key.
             if keyExists {
-                let result = runCommand("/usr/bin/ssh", args: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "torch", "echo", "ok"])
+                let pubKeyPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/id_ed25519.pub").path
+                let pubKey = (try? String(contentsOfFile: pubKeyPath, encoding: .utf8))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                // Extract just the key data (type + base64) for matching
+                let keyParts = pubKey.components(separatedBy: " ")
+                let keyData = keyParts.count >= 2 ? keyParts[1] : pubKey
+
+                let result = runCommand("/usr/bin/ssh", args: [
+                    "-o", "ConnectTimeout=5", "torch",
+                    "grep -qF '\(keyData)' ~/.ssh/authorized_keys 2>/dev/null && echo KEY_FOUND || echo KEY_MISSING"
+                ])
                 DispatchQueue.main.async {
-                    if result.success {
-                        updateCheck("key_on_server", status: .ok, description: "Key is authorized on server")
+                    if result.output.contains("KEY_FOUND") {
+                        updateCheck("key_on_server", status: .ok, description: "Key is in authorized_keys")
                         appendLog("✓ Key is authorized on torch")
                     } else {
-                        updateCheck("key_on_server", status: .needsFix, description: "Key not authorized or connection failed")
-                        appendLog("✗ Key not authorized: \(result.output)")
+                        updateCheck("key_on_server", status: .needsFix, description: "Key not in authorized_keys")
+                        appendLog("✗ Key not found in ~/.ssh/authorized_keys on torch")
                     }
                     updateCheck("agent", status: .checking)
                 }
@@ -2505,7 +2575,10 @@ struct SSHTroubleshootView: View {
         }
         
         appendLog("→ Uploading key to server...")
-        let installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '\(pubKey)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo 'KEY_INSTALLED'"
+        // Extract key data for dedup check, then append only if not already present
+        let keyParts = pubKey.components(separatedBy: " ")
+        let keyData = keyParts.count >= 2 ? keyParts[1] : pubKey
+        let installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && (grep -qF '\(keyData)' ~/.ssh/authorized_keys 2>/dev/null || echo '\(pubKey)' >> ~/.ssh/authorized_keys) && chmod 600 ~/.ssh/authorized_keys && echo 'KEY_INSTALLED'"
         let installResult = runCommand("/usr/bin/ssh", args: ["torch", installCmd])
         
         DispatchQueue.main.async {
@@ -2635,6 +2708,9 @@ struct ContentView: View {
     @AppStorage("gpu") private var gpu = false
     @AppStorage("project") private var project = ""
     @AppStorage("ide") private var ide = "vscode"
+    @AppStorage("condaEnv") private var condaEnv = ""
+    
+
     
     @State private var showingProgress = false
     @State private var showingSession = false
@@ -2728,6 +2804,15 @@ struct ContentView: View {
                         Text("None").tag("none")
                     }
                     .pickerStyle(.segmented)
+                }
+                
+                Section("Environment") {
+                    HStack {
+                        Text("Conda")
+                            .frame(width: 60, alignment: .leading)
+                        TextField("optional", text: $condaEnv)
+                            .textFieldStyle(.roundedBorder)
+                    }
                 }
                 
                 Section("Setup") {
@@ -2945,6 +3030,15 @@ struct ContentView: View {
             if !sshConfigManager.isConfigured {
                 showingSSHSetup = true
             }
+
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            // Best-effort cleanup of conda settings on app quit.
+            // Runs synchronously on the main thread — the SSH is fast if the
+            // ControlMaster session is alive, and a no-op if the network is gone.
+            if !condaEnv.isEmpty {
+                cleanupCondaBlock()
+            }
         }
     }
     
@@ -2961,9 +3055,11 @@ struct ContentView: View {
             ram: ram,
             gpu: gpu,
             project: project,
-            ide: ide
+            ide: ide,
+            condaEnv: condaEnv
         )
     }
+    
     
     private func setupRemoteServers() {
         showingRemoteSetup = true
@@ -2972,7 +3068,9 @@ struct ContentView: View {
     private func cancelExistingJobs() {
         isCancellingJob = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = runSSHCommand("scancel -u $USER --name=torchdev 2>/dev/null; echo done")
+            let result = runSSHCommand("bash -lc 'scancel -u $USER --name=torchdev 2>/dev/null'; echo done")
+            // Clean up conda activation block from shell init files
+            cleanupCondaBlock()
             DispatchQueue.main.async {
                 isCancellingJob = false
                 if result.success {
@@ -3402,9 +3500,9 @@ struct CondaSetupView: View {
     
     @State private var discoverStatus: SetupItemStatus = .pending
     @State private var loadModuleStatus: SetupItemStatus = .pending
-    @State private var condaInitStatus: SetupItemStatus = .pending
     @State private var scratchDirsStatus: SetupItemStatus = .pending
     @State private var condarcStatus: SetupItemStatus = .pending
+    @State private var forceReset = false
     
     var body: some View {
         VStack(spacing: 20) {
@@ -3450,9 +3548,6 @@ struct CondaSetupView: View {
                     SetupItemRow(title: "Verify Conda Access",
                                  path: "conda --version",
                                  status: loadModuleStatus)
-                    SetupItemRow(title: "Initialize Shell",
-                                 path: "~/.bashrc",
-                                 status: condaInitStatus)
                     SetupItemRow(title: "Create Scratch Directories",
                                  path: "/scratch/\(username)/.conda/",
                                  status: scratchDirsStatus)
@@ -3487,6 +3582,17 @@ struct CondaSetupView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                    
+                    Button(action: {
+                        forceReset = true
+                        runSetup()
+                    }) {
+                        Label("Re-run Setup", systemImage: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Remove and rewrite .condarc and scratch directories")
                 }
                 .frame(maxHeight: .infinity)
             }
@@ -3563,7 +3669,6 @@ struct CondaSetupView: View {
             self.currentStep = 1
             self.discoverStatus = .checking
             self.loadModuleStatus = .pending
-            self.condaInitStatus = .pending
             self.scratchDirsStatus = .pending
             self.condarcStatus = .pending
             self.runSetupSteps()
@@ -3571,7 +3676,18 @@ struct CondaSetupView: View {
     }
 
     private func runSetupSteps() {
+        let shouldReset = forceReset
         DispatchQueue.global(qos: .userInitiated).async {
+            // Reset existing config if requested
+            if shouldReset {
+                appendLog("Resetting conda configuration...\n")
+                // Remove .condarc
+                let _ = runSSHCommand("rm -f ~/.condarc 2>/dev/null; echo RESET_CONDARC_OK")
+                appendLog("  Removed .condarc\n")
+                appendLog("Reset complete. Running setup...\n\n")
+                DispatchQueue.main.async { forceReset = false }
+            }
+            
             // Step 1: Discover conda module
             appendLog("Searching for conda modules...\n")
             let discoverResult = runSSHCommand("bash -lc 'module avail conda 2>&1'")
@@ -3602,7 +3718,6 @@ struct CondaSetupView: View {
                 appendLog("Conda accessible.\n")
                 DispatchQueue.main.async {
                     loadModuleStatus = .ok
-                    condaInitStatus = .checking
                 }
             } else {
                 appendLog("Conda not accessible after module load.\n")
@@ -3612,25 +3727,6 @@ struct CondaSetupView: View {
                     isRunning = false
                 }
                 return
-            }
-            
-            // Step 3: conda init
-            appendLog("Checking conda init status...\n")
-            let initCheck = runSSHCommand("grep -q '>>> conda initialize >>>' ~/.bashrc 2>/dev/null && echo ALREADY_INIT || echo NEEDS_INIT")
-            
-            if initCheck.output.contains("ALREADY_INIT") {
-                appendLog("conda init already configured.\n")
-                DispatchQueue.main.async { condaInitStatus = .ok }
-            } else {
-                appendLog("Running conda init...\n")
-                let initResult = runSSHCommand("bash -lc 'module load \(version!) && conda init bash 2>&1'")
-                appendLog(initResult.output)
-                DispatchQueue.main.async {
-                    condaInitStatus = initResult.success ? .ok : .error
-                    if !initResult.success {
-                        errorMessage = "conda init failed."
-                    }
-                }
             }
             
             DispatchQueue.main.async { scratchDirsStatus = .checking }
@@ -3664,6 +3760,14 @@ struct CondaSetupView: View {
                         errorMessage = "Failed to write .condarc."
                     }
                 }
+            }
+            
+            // Ensure TOS is accepted in .condarc (Anaconda 2024.06+ blocks
+            // conda create/install with an interactive prompt without this)
+            let tosCheck = runSSHCommand("grep -q 'tos_accepted' ~/.condarc 2>/dev/null && echo TOS_SET || echo TOS_MISSING")
+            if tosCheck.output.contains("TOS_MISSING") {
+                appendLog("Accepting conda TOS...\n")
+                let _ = runSSHCommand("printf '\\ntos_accepted: true\\n' >> ~/.condarc")
             }
             
             DispatchQueue.main.async {
@@ -4046,15 +4150,24 @@ struct CondaEnvSetupView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Create environment (with idempotency check)
             appendLog("Checking if environment '\(name)' exists...\n")
-            let envCheck = runSSHCommand("bash -lc 'module load \(mod) && conda env list 2>/dev/null | grep -q \"^\\s*\(name) \" && echo EXISTS || echo MISSING'")
+            let envCheck = runSSHCommand("bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda env list 2>/dev/null | grep -q \"^\\s*\(name) \" && echo EXISTS || echo MISSING'")
             
             if envCheck.output.contains("EXISTS") {
                 appendLog("Environment '\(name)' already exists.\n")
                 DispatchQueue.main.async { createEnvStatus = .ok }
             } else {
                 appendLog("Creating environment '\(name)'...\n")
-                let packageSpec = lang == .python ? "python=\(ver)" : "r-base=\(ver)"
-                let createResult = runSSHCommand("bash -lc 'module load \(mod) && conda create -n \(name) \(packageSpec) -y 2>&1'",
+                let packageSpec: String
+                let channelFlag: String
+                if lang == .python {
+                    packageSpec = "python=\(ver)"
+                    channelFlag = ""
+                } else {
+                    // r-irkernel pulls in r-base, jupyter, and all kernel dependencies
+                    packageSpec = "r-base=\(ver) r-irkernel"
+                    channelFlag = "-c conda-forge"
+                }
+                let createResult = runSSHCommand("bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda create -n \(name) \(channelFlag) \(packageSpec) -y 2>&1'",
                     processCallback: { [self] p in currentProcess = p })
                 appendLog(createResult.output)
                 if createResult.success {
@@ -4079,8 +4192,8 @@ struct CondaEnvSetupView: View {
             DispatchQueue.main.async { verifyLangStatus = .checking }
             appendLog("Verifying \(lang.rawValue) installation...\n")
             let verifyCmd = lang == .python
-                ? "bash -lc 'module load \(mod) && conda run -n \(name) python --version 2>&1'"
-                : "bash -lc 'module load \(mod) && conda run -n \(name) Rscript --version 2>&1'"
+                ? "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda run -n \(name) python --version 2>&1'"
+                : "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && eval \"$(conda shell.bash hook 2>/dev/null)\" && conda activate \(name) && Rscript --version 2>&1'"
             let verifyResult = runSSHCommand(verifyCmd)
             appendLog(verifyResult.output)
             DispatchQueue.main.async {
@@ -4093,7 +4206,7 @@ struct CondaEnvSetupView: View {
             // Step 3: Register Jupyter kernel
             DispatchQueue.main.async { registerKernelStatus = .checking }
             appendLog("Checking for existing kernel...\n")
-            let kernelCheck = runSSHCommand("bash -lc 'module load \(mod) && conda run -n \(name) jupyter kernelspec list 2>/dev/null | grep -q \"\(name)\" && echo KERNEL_EXISTS || echo KERNEL_MISSING'")
+            let kernelCheck = runSSHCommand("bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && eval \"$(conda shell.bash hook 2>/dev/null)\" && conda activate \(name) && jupyter kernelspec list 2>/dev/null | grep -qi \"\(name)\" && echo KERNEL_EXISTS || echo KERNEL_MISSING'")
             
             if kernelCheck.output.contains("KERNEL_EXISTS") {
                 appendLog("Kernel '\(name)' already registered.\n")
@@ -4102,9 +4215,11 @@ struct CondaEnvSetupView: View {
                 appendLog("Registering kernel...\n")
                 let kernelCmd: String
                 if lang == .python {
-                    kernelCmd = "bash -lc 'module load \(mod) && conda run -n \(name) pip install ipykernel 2>&1 && conda run -n \(name) python -m ipykernel install --user --name \(name) --display-name \"Python (\(name))\" 2>&1'"
+                    kernelCmd = "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda run -n \(name) pip install ipykernel 2>&1 && conda run -n \(name) python -m ipykernel install --user --name \(name) --display-name \"Python (\(name))\" 2>&1'"
                 } else {
-                    kernelCmd = "bash -lc 'module load \(mod) && conda run -n \(name) Rscript -e \"install.packages(\\\"IRkernel\\\", repos=\\\"https://cloud.r-project.org\\\")\" 2>&1 && conda run -n \(name) Rscript -e \"IRkernel::installspec(name=\\\"\(name)\\\", displayname=\\\"R (\(name))\\\")\" 2>&1'"
+                    // IRkernel was installed via conda in Step 1; just register the kernel spec
+                    // Use conda activate instead of conda run — conda run doesn't reliably set PATH for R
+                    kernelCmd = "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && eval \"$(conda shell.bash hook 2>/dev/null)\" && conda activate \(name) && Rscript -e \"IRkernel::installspec(name=\\\"\(name)\\\", displayname=\\\"R (\(name))\\\")\" 2>&1'"
                 }
                 let kernelResult = runSSHCommand(kernelCmd)
                 appendLog(kernelResult.output)
@@ -4153,7 +4268,7 @@ struct CondaEnvSetupView: View {
             let mod = condaModule
             let name = envName.trimmingCharacters(in: .whitespaces)
             DispatchQueue.global(qos: .utility).async {
-                let _ = runSSHCommand("bash -lc 'module load \(mod) && conda env remove -n \(name) -y 2>&1'")
+                let _ = runSSHCommand("bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda env remove -n \(name) -y 2>&1'")
             }
         }
         
@@ -4165,7 +4280,7 @@ struct CondaEnvSetupView: View {
         let name = envName.trimmingCharacters(in: .whitespaces)
         appendLog("Cleaning up partial environment '\(name)'...\n")
         DispatchQueue.global(qos: .utility).async {
-            let result = runSSHCommand("bash -lc 'module load \(mod) && conda env remove -n \(name) -y 2>&1'")
+            let result = runSSHCommand("bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load \(mod) && conda env remove -n \(name) -y 2>&1'")
             appendLog(result.output)
             DispatchQueue.main.async {
                 envWasCreated = false

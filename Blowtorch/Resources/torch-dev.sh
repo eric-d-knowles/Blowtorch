@@ -89,10 +89,20 @@ cleanup() {
     if [[ "$SCRIPT_SUCCESS" != "true" ]]; then
         printf '\033[1;31mCleaning up...\033[0m\n'
         _kill_tunnel
+        # Remove conda settings on failure
+        if [[ -n "${CONDA_ENV:-}" ]]; then
+            ssh torch-compute "
+                rm -f ~/.vscode-server/data/Machine/settings.json 2>/dev/null
+                rm -f ~/.positron-server/data/Machine/settings.json 2>/dev/null
+            " 2>/dev/null || true
+        fi
         if [[ -n "${JOB_ID:-}" ]]; then
-            ssh torch "scancel $JOB_ID 2>/dev/null || true" 2>/dev/null || true
+            ssh torch "bash -lc 'scancel $JOB_ID 2>/dev/null || true'" 2>/dev/null || true
         fi
     fi
+    # On success, the Machine settings.json is intentionally left in place.
+    # The Blowtorch app cleans it when the session ends (cancel job, new
+    # connect, or app quit).
 }
 trap cleanup EXIT
 
@@ -105,6 +115,7 @@ DEFAULT_GPU=no
 DEFAULT_PROJECT=""
 DEFAULT_ACCOUNT="torch_pr_217_general"
 DEFAULT_IDE="vscode"
+DEFAULT_CONDA_ENV=""
 
 [[ -f "$PREFS_FILE" ]] && source "$PREFS_FILE"
 
@@ -116,6 +127,7 @@ GPU="${GPU:-$DEFAULT_GPU}"
 PROJECT="${PROJECT:-$DEFAULT_PROJECT}"
 ACCOUNT="${ACCOUNT:-$DEFAULT_ACCOUNT}"
 IDE="${IDE:-$DEFAULT_IDE}"
+CONDA_ENV="${CONDA_ENV:-$DEFAULT_CONDA_ENV}"
 
 # =============================================================================
 # Check for GUI-provided settings via environment variables
@@ -130,6 +142,7 @@ if [[ "${TORCH_SKIP_PROMPTS:-}" == "1" ]]; then
     GPU="${TORCH_GPU:-$GPU}"
     PROJECT="${TORCH_PROJECT:-$PROJECT}"
     IDE="${TORCH_IDE:-$IDE}"
+    CONDA_ENV="${TORCH_CONDA_ENV:-$CONDA_ENV}"
     
     echo -e "\033[1;34mSettings from Torch Dev app:\033[0m"
     echo "  Account:   $ACCOUNT"
@@ -140,6 +153,7 @@ if [[ "${TORCH_SKIP_PROMPTS:-}" == "1" ]]; then
     echo "  GPU:       $GPU"
     echo "  Project:   ${PROJECT:-none}"
     echo "  IDE:       $IDE"
+    echo "  Conda env: ${CONDA_ENV:-none}"
     echo
 else
     # --- Interactive prompts ---
@@ -156,6 +170,7 @@ else
     read -p "  GPU? [yes/no] (default: $GPU): " input_gpu
     read -p "  Project path under /scratch/$CLUSTER_USER/ (default: ${PROJECT:-none}): " input_project
     read -p "  IDE [vscode/positron] (default: $IDE): " input_ide
+    read -p "  Conda environment (optional): " input_conda_env
     echo
 
     [[ -n "$input_account" ]]   && ACCOUNT="$input_account"
@@ -166,6 +181,7 @@ else
     [[ -n "$input_gpu" ]]       && GPU="$input_gpu"
     [[ -n "$input_project" ]]   && PROJECT="$input_project"
     [[ -n "$input_ide" ]]       && IDE="$input_ide"
+    [[ -n "$input_conda_env" ]] && CONDA_ENV="$input_conda_env"
 fi
 
 # Normalize RAM
@@ -189,6 +205,7 @@ GPU=$GPU
 PROJECT="$PROJECT"
 ACCOUNT="$ACCOUNT"
 IDE="$IDE"
+CONDA_ENV="$CONDA_ENV"
 EOF
 
 # Build project path
@@ -227,7 +244,7 @@ echo
 # Step 2: Cancel old jobs and submit a new one
 # =============================================================================
 echo -e "\033[1;34mCleaning up old jobs...\033[0m"
-ssh torch "scancel -u $CLUSTER_USER --name=torchdev 2>/dev/null || true"
+ssh torch "bash -lc 'scancel -u $CLUSTER_USER --name=torchdev 2>/dev/null || true'"
 ssh torch "mkdir -p ~/.config/torch"
 
 echo -e "\033[1;34mSubmitting job...\033[0m"
@@ -244,7 +261,7 @@ SBATCH_CMD="$SBATCH_CMD --cpus-per-task=$CPUS --mem=$RAM"
 [[ -n "$GPU_FLAG" ]] && SBATCH_CMD="$SBATCH_CMD $GPU_FLAG"
 SBATCH_CMD="$SBATCH_CMD --wrap=\"sleep infinity\""
 
-JOB_ID=$(ssh torch "$SBATCH_CMD")
+JOB_ID=$(ssh torch "bash -lc '$SBATCH_CMD'")
 echo "Submitted job $JOB_ID"
 
 # =============================================================================
@@ -253,7 +270,7 @@ echo "Submitted job $JOB_ID"
 echo -e "\033[1;34mWaiting for compute node...\033[0m"
 COMPUTE_NODE=""
 for i in {1..1800}; do
-    COMPUTE_NODE=$(ssh torch "squeue -j $JOB_ID -h -o '%N' 2>/dev/null | grep -v '^$'" || true)
+    COMPUTE_NODE=$(ssh torch "bash -lc \"squeue -j $JOB_ID -h -o '%N' 2>/dev/null | grep -v '^\$'\"" || true)
     if [[ -n "$COMPUTE_NODE" ]]; then
         break
     fi
@@ -265,7 +282,7 @@ echo
 if [[ -z "$COMPUTE_NODE" ]]; then
     echo -e "\033[1;31mTimed out waiting for allocation (30 minutes).\033[0m"
     echo "Cancelling job $JOB_ID..."
-    ssh torch "scancel $JOB_ID 2>/dev/null" || true
+    ssh torch "bash -lc 'scancel $JOB_ID 2>/dev/null'" || true
     exit 1
 fi
 
@@ -352,6 +369,173 @@ echo
 
 # Pre-trigger automount on compute node so /scratch is ready before VS Code connects
 ssh torch-compute "ls /scratch/\$USER > /dev/null 2>&1 || true" 2>/dev/null || true
+
+# =============================================================================
+# Step 6.5: Activate conda environment on compute node (if requested)
+# =============================================================================
+if [[ -n "${CONDA_ENV:-}" ]]; then
+    echo -e "\033[1;34mActivating conda environment: $CONDA_ENV\033[0m"
+
+    # Discover the conda module name on the login node
+    CONDA_MODULE=$(ssh torch "bash -lc 'module avail conda 2>&1'" | \
+        grep -oE 'anaconda3/[0-9]{4}\.[0-9]{2}' | sort | tail -1)
+    CONDA_MODULE="${CONDA_MODULE:-anaconda3}"
+
+    # Find the conda binary path on the compute node
+    CONDA_EXE_PATH=$(ssh torch-compute "bash -lc 'module load ${CONDA_MODULE} 2>/dev/null; echo \$CONDA_EXE'" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$CONDA_EXE_PATH" ]]; then
+        # Fallback: probe common install locations
+        CONDA_EXE_PATH=$(ssh torch-compute "for p in /share/apps/anaconda3/*/bin/conda /opt/conda/bin/conda; do [ -f \"\$p\" ] && echo \"\$p\" && break; done" 2>/dev/null | tr -d '[:space:]')
+    fi
+
+    if [[ -z "$CONDA_EXE_PATH" ]]; then
+        echo -e "\033[1;31mCould not locate conda on the compute node.\033[0m"
+        exit 1
+    fi
+    CONDA_ROOT=$(dirname "$(dirname "$CONDA_EXE_PATH")")
+    echo "  conda: $CONDA_EXE_PATH"
+
+    # Verify the environment exists; fall back to base if not found
+    ENV_EXISTS=$(ssh torch-compute "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load ${CONDA_MODULE} 2>&1 && conda env list 2>/dev/null'" | \
+        awk '{print $1}' | grep -x "${CONDA_ENV}" || true)
+    if [[ -z "$ENV_EXISTS" ]]; then
+        echo -e "\033[1;33mConda environment '${CONDA_ENV}' not found. Falling back to base.\033[0m"
+        echo "Available environments:"
+        ssh torch-compute "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load ${CONDA_MODULE} 2>&1 && conda env list 2>/dev/null'" | grep -v '^#' | grep -v '^$' || true
+        CONDA_ENV="base"
+    fi
+
+    # Find the environment's prefix path
+    if [[ "$CONDA_ENV" == "base" ]]; then
+        ENV_PREFIX="$CONDA_ROOT"
+    else
+        ENV_PREFIX=$(ssh torch-compute "bash -lc 'export CONDA_PLUGINS_AUTO_ACCEPT_TOS=yes; module load ${CONDA_MODULE} 2>/dev/null; conda env list 2>/dev/null'" | \
+            awk -v env="$CONDA_ENV" '$1 == env {print $NF}' | tr -d '[:space:]')
+        ENV_PREFIX="${ENV_PREFIX:-/scratch/${CLUSTER_USER}/.conda/envs/${CONDA_ENV}}"
+    fi
+
+    # Check which language runtimes the env has
+    ENV_CHECKS=$(ssh torch-compute "
+        [ -x '${ENV_PREFIX}/bin/python' ] && echo HAS_PYTHON || true
+        [ -x '${ENV_PREFIX}/bin/R' ] && echo HAS_R || true
+    " 2>/dev/null)
+    HAS_PYTHON=$(echo "$ENV_CHECKS" | grep -c HAS_PYTHON || true)
+    HAS_R=$(echo "$ENV_CHECKS" | grep -c HAS_R || true)
+
+    BASE_PYTHON="${CONDA_ROOT}/bin/python"
+    if [[ "$HAS_PYTHON" -gt 0 ]]; then
+        PYTHON_PATH="${ENV_PREFIX}/bin/python"
+        echo "  python: $PYTHON_PATH"
+    else
+        PYTHON_PATH="$BASE_PYTHON"
+        echo "  python: $PYTHON_PATH (base — env has no Python)"
+    fi
+    if [[ "$HAS_R" -gt 0 ]]; then
+        R_PATH="${ENV_PREFIX}/bin/R"
+        echo "  R: $R_PATH"
+    fi
+
+    # Determine which server directory to use
+    if [[ "$IDE" == "positron" ]]; then
+        SERVER_DIR_NAME=".positron-server"
+    else
+        SERVER_DIR_NAME=".vscode-server"
+    fi
+
+    # Write Machine settings.json with conda paths.
+    # VS Code reads ~/.vscode-server/data/Machine/settings.json for remote
+    # machine-level settings. Positron reads ~/.positron-server/data/Machine/settings.json.
+    # This tells the Python/R extensions where to find interpreters and conda,
+    # and enables terminal auto-activation via a custom profile.
+    #
+    # Build the settings JSON dynamically based on IDE and env contents.
+    SETTINGS_ENTRIES=""
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"python.defaultInterpreterPath\": \"${PYTHON_PATH}\",\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"python.condaPath\": \"${CONDA_EXE_PATH}\",\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"python.terminal.activateEnvironment\": true,\n"
+
+    # Positron R interpreter settings
+    if [[ "$IDE" == "positron" && "$HAS_R" -gt 0 ]]; then
+        SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"positron.r.interpreters.default\": \"${R_PATH}\",\n"
+        SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"positron.r.customBinaries\": [\"${R_PATH}\"],\n"
+    fi
+
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"terminal.integrated.profiles.linux\": {\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}        \"conda-bash\": {\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}            \"path\": \"bash\",\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}            \"args\": [\"--init-file\", \"/tmp/torch-conda-init.sh\"]\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}        }\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    },\n"
+    SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"terminal.integrated.defaultProfile.linux\": \"conda-bash\""
+
+    # Write the settings JSON to a local temp file, then include it in the setup script
+    SETTINGS_JSON=$(mktemp)
+    {
+        echo "{"
+        echo -e "$SETTINGS_ENTRIES"
+        echo "}"
+    } > "$SETTINGS_JSON"
+
+    # Build the conda init script content
+    INIT_SCRIPT="# Source system profile for module/slurm commands
+[ -f /etc/profile ] && . /etc/profile
+# Source user bashrc for any custom settings
+[ -f ~/.bashrc ] && . ~/.bashrc
+# Activate conda environment
+. ${CONDA_ROOT}/etc/profile.d/conda.sh 2>/dev/null || true
+conda activate ${CONDA_ENV} 2>/dev/null || true"
+
+    SETUP_SCRIPT=$(mktemp)
+    cat > "$SETUP_SCRIPT" <<LOCALEOF
+#!/bin/bash
+SERVER_DIR="\$HOME/${SERVER_DIR_NAME}"
+SETTINGS_DIR="\$SERVER_DIR/data/Machine"
+mkdir -p "\$SETTINGS_DIR"
+
+# Write Machine settings
+cat > "\$SETTINGS_DIR/settings.json" <<'SETTINGSEOF'
+$(cat "$SETTINGS_JSON")
+SETTINGSEOF
+
+# Write terminal init script
+cat > /tmp/torch-conda-init.sh <<'INITEOF'
+${INIT_SCRIPT}
+INITEOF
+
+# Clean up legacy blocks from previous approaches
+sed -i '/# >>> torch-conda-env >>>/,/# <<< torch-conda-env <<</d' ~/.bashrc 2>/dev/null || true
+sed -i '/# >>> torch-conda-env >>>/,/# <<< torch-conda-env <<</d' ~/.bash_profile 2>/dev/null || true
+sed -i '/# >>> torch-conda-env >>>/,/# <<< torch-conda-env <<</d' "\$SERVER_DIR/server-env-setup" 2>/dev/null || true
+LOCALEOF
+    rm -f "$SETTINGS_JSON"
+
+    SETUP_RC=0
+    scp -q "$SETUP_SCRIPT" torch-compute:/tmp/torch-conda-setup.sh 2>&1 || {
+        SETUP_RC=$?
+        echo -e "\033[1;31mFailed to copy conda setup script to compute node (scp exit $SETUP_RC).\033[0m"
+        rm -f "$SETUP_SCRIPT"
+        exit 1
+    }
+    SETUP_RC=0
+    ssh torch-compute "bash /tmp/torch-conda-setup.sh && rm -f /tmp/torch-conda-setup.sh" 2>/dev/null || SETUP_RC=$?
+    rm -f "$SETUP_SCRIPT"
+
+    if [[ $SETUP_RC -ne 0 ]]; then
+        echo -e "\033[1;31mFailed to write conda settings to compute node.\033[0m"
+        exit 1
+    fi
+
+    # Verify settings were written
+    if ssh torch-compute "[ -f ~/${SERVER_DIR_NAME}/data/Machine/settings.json ]" 2>/dev/null; then
+        echo -e "\033[1;32mConda environment configured: $CONDA_ENV\033[0m"
+    else
+        echo -e "\033[1;33mWarning: failed to write conda settings.\033[0m"
+    fi
+
+    # Kill any stale VS Code / Positron server processes so the IDE launches a
+    # fresh server that reads the new settings.
+    ssh torch-compute "pkill -f '\.vscode-server.*node' 2>/dev/null; pkill -f '\.positron-server.*node' 2>/dev/null" || true
+fi
 
 # =============================================================================
 # Step 7: Launch IDE
@@ -468,6 +652,7 @@ echo -e "  Tunnel:        \033[1;33mlocalhost:$TUNNEL_PORT -> $COMPUTE_NODE:22\0
 echo -e "  Work dir:      \033[1;33m$WORK_DIR\033[0m"
 echo -e "  Time limit:    \033[1;33m${TIME_HOURS}h\033[0m"
 echo -e "  IDE:           \033[1;33m$IDE\033[0m"
+echo -e "  Conda env:    \033[1;33m${CONDA_ENV:-none}\033[0m"
 echo
 echo -e "To cancel job:   \033[1;33mssh torch 'scancel $JOB_ID'\033[0m"
 echo -e "To kill tunnel:  \033[1;33mkill \$(cat ~/.config/torch/tunnel.pid)\033[0m"
