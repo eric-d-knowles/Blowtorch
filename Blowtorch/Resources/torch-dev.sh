@@ -61,18 +61,6 @@ _find_free_port() {
     exit 1
 }
 
-# --- Helper: check if existing tunnel is still alive ---
-_tunnel_alive() {
-    local pid port
-    [[ -f "$TUNNEL_PID_FILE" ]] || return 1
-    [[ -f "$TUNNEL_PORT_FILE" ]] || return 1
-    pid=$(cat "$TUNNEL_PID_FILE")
-    port=$(cat "$TUNNEL_PORT_FILE")
-    kill -0 "$pid" 2>/dev/null || return 1
-    (echo > /dev/tcp/localhost/$port) 2>/dev/null || return 1
-    return 0
-}
-
 # --- Helper: kill existing tunnel ---
 _kill_tunnel() {
     if [[ -f "$TUNNEL_PID_FILE" ]]; then
@@ -343,7 +331,9 @@ Host torch-compute
     Port $TUNNEL_PORT
     User $CLUSTER_USER
     IdentityFile ~/.ssh/id_ed25519
-    PreferredAuthentications publickey
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist yes
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     ServerAliveInterval 60
@@ -355,7 +345,30 @@ mv "$TMPFILE" "$SSH_CONFIG"
 chmod 600 "$SSH_CONFIG"
 
 # =============================================================================
-# Step 6: Wait for SSH to be ready through the tunnel
+# Step 6: Authenticate to compute node
+# =============================================================================
+echo -e "\033[1;34mChecking SSH connection to compute node...\033[0m"
+if ssh -O check torch-compute 2>/dev/null; then
+    echo "Already authenticated (reusing existing session)."
+else
+    echo "NEEDS_COMPUTE_AUTH"
+    echo "Browser authentication required for compute node."
+    echo "Complete the sign-in, then click Continue in the app."
+    echo
+
+    ssh -fNM torch-compute
+
+    if ssh -O check torch-compute 2>/dev/null; then
+        echo "Authenticated successfully."
+    else
+        echo -e "\033[1;31mCompute node authentication failed.\033[0m"
+        exit 1
+    fi
+fi
+echo
+
+# =============================================================================
+# Step 6.5: Wait for SSH to be ready through the tunnel
 # =============================================================================
 echo -e "\033[1;34mWaiting for SSH on compute node...\033[0m"
 for i in {1..30}; do
@@ -371,7 +384,7 @@ echo
 ssh torch-compute "ls /scratch/\$USER > /dev/null 2>&1 || true" 2>/dev/null || true
 
 # =============================================================================
-# Step 6.5: Activate conda environment on compute node (if requested)
+# Step 7: Activate conda environment on compute node (if requested)
 # =============================================================================
 if [[ -n "${CONDA_ENV:-}" ]]; then
     echo -e "\033[1;34mActivating conda environment: $CONDA_ENV\033[0m"
@@ -538,7 +551,8 @@ LOCALEOF
 fi
 
 # =============================================================================
-# Step 7: Launch IDE
+# Step 8: Launch IDE
+
 # =============================================================================
 # --- Helper: find a CLI by name, checking PATH and common install locations ---
 _find_cli() {

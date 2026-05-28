@@ -178,7 +178,7 @@ class SSHAuthManager: ObservableObject {
             let data = handle.availableData
             guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
             DispatchQueue.main.async {
-                if text.contains("NEEDS_AUTH") || text.contains("browser") || text.contains("microsoft.com") {
+                if text.contains("NEEDS_AUTH") || text.contains("NEEDS_COMPUTE_AUTH") || text.contains("browser") || text.contains("microsoft.com") {
                     self.authRequired = true
                     self.isAuthenticating = false
                 }
@@ -919,10 +919,16 @@ class ConnectionManager: ObservableObject {
         // Parse output for status updates
         let lines = output.components(separatedBy: .newlines)
         for line in lines {
-            // Check for auth needed
+            // Check for auth needed (login node)
             if line.contains("NEEDS_AUTH") {
                 authRequired = true
                 updateStep("auth", status: .needsAuth, detail: "Browser sign-in required")
+            }
+
+            // Check for auth needed (compute node)
+            if line.contains("NEEDS_COMPUTE_AUTH") {
+                authRequired = true
+                updateStep("ssh", status: .needsAuth, detail: "Browser sign-in required for compute node")
             }
             
             // Check for auth prompt - extract PIN code
@@ -1346,7 +1352,7 @@ struct ConnectionProgressView: View {
                                     .textSelection(.enabled)
                                     .id("log")
                             }
-                            .onChange(of: manager.logOutput) { _ in
+                            .onChange(of: manager.logOutput) {
                                 proxy.scrollTo("log", anchor: .bottom)
                             }
                         }
@@ -1377,8 +1383,8 @@ struct ConnectionProgressView: View {
         .animation(.easeInOut(duration: 0.2), value: manager.authRequired)
         .animation(.easeInOut(duration: 0.2), value: showLog)
         .animation(.easeInOut(duration: 0.2), value: detailCount)
-        .onChange(of: manager.completedSuccessfully) { completed in
-            if completed {
+        .onChange(of: manager.completedSuccessfully) {
+            if manager.completedSuccessfully {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     dismiss()
                 }
@@ -2760,7 +2766,7 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                             .multilineTextAlignment(.trailing)
-                            .onChange(of: hours) { _ in hours = max(1, min(24, hours)) }
+                            .onChange(of: hours) { hours = max(1, min(24, hours)) }
                     }
                     
                     HStack {
@@ -2770,7 +2776,7 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                             .multilineTextAlignment(.trailing)
-                            .onChange(of: cpus) { _ in cpus = max(1, min(100, cpus)) }
+                            .onChange(of: cpus) { cpus = max(1, min(100, cpus)) }
                     }
                     
                     HStack {
@@ -2780,7 +2786,7 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                             .multilineTextAlignment(.trailing)
-                            .onChange(of: ram) { _ in ram = max(1, min(500, ram)) }
+                            .onChange(of: ram) { ram = max(1, min(500, ram)) }
                     }
                     
                     Toggle("GPU", isOn: $gpu)
@@ -3874,7 +3880,7 @@ struct CondaEnvSetupView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        .onChange(of: language) { _ in
+                        .onChange(of: language) {
                             selectedVersion = ""
                             availableVersions = []
                             fetchVersions()
