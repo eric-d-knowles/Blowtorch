@@ -178,7 +178,7 @@ class SSHAuthManager: ObservableObject {
             let data = handle.availableData
             guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
             DispatchQueue.main.async {
-                if text.contains("NEEDS_AUTH") || text.contains("NEEDS_COMPUTE_AUTH") || text.contains("browser") || text.contains("microsoft.com") {
+                if text.contains("NEEDS_AUTH") || text.contains("browser") || text.contains("microsoft.com") {
                     self.authRequired = true
                     self.isAuthenticating = false
                 }
@@ -925,12 +925,6 @@ class ConnectionManager: ObservableObject {
                 updateStep("auth", status: .needsAuth, detail: "Browser sign-in required")
             }
 
-            // Check for auth needed (compute node)
-            if line.contains("NEEDS_COMPUTE_AUTH") {
-                authRequired = true
-                updateStep("ssh", status: .needsAuth, detail: "Browser sign-in required for compute node")
-            }
-            
             // Check for auth prompt - extract PIN code
             if line.contains("Authenticate with PIN") {
                 authRequired = true
@@ -984,19 +978,14 @@ class ConnectionManager: ObservableObject {
                 updateStep("tunnel", status: .inProgress)
             }
             
-            // Tunnel active
-            if line.contains("Tunnel active") {
+            // SSH config updated (tunnel active, config written)
+            if line.contains("Updating SSH config") {
                 updateStep("tunnel", status: .success)
                 updateStep("ssh", status: .inProgress)
             }
             
             // SSH ready / Waiting for SSH
             if line.contains("Waiting for SSH") {
-                updateStep("ssh", status: .inProgress)
-            }
-            
-            // SSH config updated means SSH is working
-            if line.contains("Updating SSH config") {
                 updateStep("ssh", status: .inProgress)
             }
             

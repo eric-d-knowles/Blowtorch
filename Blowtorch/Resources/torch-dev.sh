@@ -88,9 +88,9 @@ cleanup() {
             ssh torch "bash -lc 'scancel $JOB_ID 2>/dev/null || true'" 2>/dev/null || true
         fi
     fi
-    # On success, the Machine settings.json is intentionally left in place.
-    # The Blowtorch app cleans it when the session ends (cancel job, new
-    # connect, or app quit).
+    # On success, the tunnel and Machine settings.json are intentionally left
+    # in place. The Blowtorch app cleans them when the session ends (cancel
+    # job, new connect, or app quit).
 }
 trap cleanup EXIT
 
@@ -277,7 +277,7 @@ fi
 echo -e "\033[1;32mAllocated: $COMPUTE_NODE\033[0m"
 
 # =============================================================================
-# Step 4: Start a local port-forward tunnel to the compute node
+# Step 4: Start tunnel and update SSH config
 # =============================================================================
 echo -e "\033[1;34mStarting tunnel to compute node...\033[0m"
 _kill_tunnel
@@ -308,9 +308,6 @@ if ! (echo > /dev/tcp/localhost/$TUNNEL_PORT) 2>/dev/null; then
 fi
 echo "Tunnel active: localhost:$TUNNEL_PORT -> $COMPUTE_NODE:22"
 
-# =============================================================================
-# Step 5: Update SSH config with a clean torch-compute entry
-# =============================================================================
 echo -e "\033[1;34mUpdating SSH config...\033[0m"
 
 TMPFILE=$(mktemp)
@@ -330,10 +327,6 @@ Host torch-compute
     HostName localhost
     Port $TUNNEL_PORT
     User $CLUSTER_USER
-    IdentityFile ~/.ssh/id_ed25519
-    ControlMaster auto
-    ControlPath ~/.ssh/cm-%r@%h:%p
-    ControlPersist yes
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     ServerAliveInterval 60
@@ -345,30 +338,7 @@ mv "$TMPFILE" "$SSH_CONFIG"
 chmod 600 "$SSH_CONFIG"
 
 # =============================================================================
-# Step 6: Authenticate to compute node
-# =============================================================================
-echo -e "\033[1;34mChecking SSH connection to compute node...\033[0m"
-if ssh -O check torch-compute 2>/dev/null; then
-    echo "Already authenticated (reusing existing session)."
-else
-    echo "NEEDS_COMPUTE_AUTH"
-    echo "Browser authentication required for compute node."
-    echo "Complete the sign-in, then click Continue in the app."
-    echo
-
-    ssh -fNM torch-compute
-
-    if ssh -O check torch-compute 2>/dev/null; then
-        echo "Authenticated successfully."
-    else
-        echo -e "\033[1;31mCompute node authentication failed.\033[0m"
-        exit 1
-    fi
-fi
-echo
-
-# =============================================================================
-# Step 6.5: Wait for SSH to be ready through the tunnel
+# Step 5: Wait for SSH to be ready on compute node
 # =============================================================================
 echo -e "\033[1;34mWaiting for SSH on compute node...\033[0m"
 for i in {1..30}; do
@@ -384,7 +354,7 @@ echo
 ssh torch-compute "ls /scratch/\$USER > /dev/null 2>&1 || true" 2>/dev/null || true
 
 # =============================================================================
-# Step 7: Activate conda environment on compute node (if requested)
+# Step 6: Activate conda environment on compute node (if requested)
 # =============================================================================
 if [[ -n "${CONDA_ENV:-}" ]]; then
     echo -e "\033[1;34mActivating conda environment: $CONDA_ENV\033[0m"
@@ -551,7 +521,7 @@ LOCALEOF
 fi
 
 # =============================================================================
-# Step 8: Launch IDE
+# Step 7: Launch IDE
 
 # =============================================================================
 # --- Helper: find a CLI by name, checking PATH and common install locations ---
@@ -662,13 +632,13 @@ echo
 echo -e "\033[1;34mSession info:\033[0m"
 echo -e "  Job ID:        \033[1;33m$JOB_ID\033[0m"
 echo -e "  Compute node:  \033[1;33m$COMPUTE_NODE\033[0m"
-echo -e "  Tunnel:        \033[1;33mlocalhost:$TUNNEL_PORT -> $COMPUTE_NODE:22\033[0m"
+echo -e "  Access:        \033[1;33mlocalhost:$TUNNEL_PORT -> $COMPUTE_NODE\033[0m"
 echo -e "  Work dir:      \033[1;33m$WORK_DIR\033[0m"
 echo -e "  Time limit:    \033[1;33m${TIME_HOURS}h\033[0m"
 echo -e "  IDE:           \033[1;33m$IDE\033[0m"
 echo -e "  Conda env:    \033[1;33m${CONDA_ENV:-none}\033[0m"
 echo
 echo -e "To cancel job:   \033[1;33mssh torch 'scancel $JOB_ID'\033[0m"
-echo -e "To kill tunnel:  \033[1;33mkill \$(cat ~/.config/torch/tunnel.pid)\033[0m"
+echo -e "To close session: \033[1;33mssh -O exit torch\033[0m"
 
 SCRIPT_SUCCESS=true
