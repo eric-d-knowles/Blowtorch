@@ -131,7 +131,7 @@ if [[ "${TORCH_SKIP_PROMPTS:-}" == "1" ]]; then
     PROJECT="${TORCH_PROJECT:-$PROJECT}"
     IDE="${TORCH_IDE:-$IDE}"
     CONDA_ENV="${TORCH_CONDA_ENV:-$CONDA_ENV}"
-    
+
     echo -e "\033[1;34mSettings from Torch Dev app:\033[0m"
     echo "  Account:   $ACCOUNT"
     echo "  Hours:     $TIME_HOURS"
@@ -214,10 +214,10 @@ else
     echo "Browser authentication required."
     echo "Complete the sign-in, then click Continue in the app."
     echo
-    
+
     # ssh -fNM will show PIN, wait for Enter, then background after auth
     ssh -fNM torch
-    
+
     # Check if it worked
     if ssh -O check torch 2>/dev/null; then
         echo "Authenticated successfully."
@@ -414,8 +414,11 @@ if [[ -n "${CONDA_ENV:-}" ]]; then
         echo "  python: $PYTHON_PATH (base — env has no Python)"
     fi
     if [[ "$HAS_R" -gt 0 ]]; then
+        # Point Positron at the REAL R binary in its canonical location so R
+        # discovery succeeds. Activation is injected separately via
+        # Renviron.site (built below), which real R sources on every startup.
         R_PATH="${ENV_PREFIX}/bin/R"
-        echo "  R: $R_PATH"
+        echo "  R: $R_PATH (env activation via Renviron.site)"
     fi
 
     # Determine which server directory to use
@@ -437,7 +440,9 @@ if [[ -n "${CONDA_ENV:-}" ]]; then
     SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"python.condaPath\": \"${CONDA_EXE_PATH}\",\n"
     SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"python.terminal.activateEnvironment\": true,\n"
 
-    # Positron R interpreter settings
+    # Positron R interpreter settings — point at the real R binary. The R
+    # console/kernel inherits the activated env via Renviron.site, not a wrapper
+    # (Positron's R discovery rejects wrapper scripts as "unusable").
     if [[ "$IDE" == "positron" && "$HAS_R" -gt 0 ]]; then
         SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"positron.r.interpreters.default\": \"${R_PATH}\",\n"
         SETTINGS_ENTRIES="${SETTINGS_ENTRIES}    \"positron.r.customBinaries\": [\"${R_PATH}\"],\n"
@@ -468,6 +473,41 @@ if [[ -n "${CONDA_ENV:-}" ]]; then
 . ${CONDA_ROOT}/etc/profile.d/conda.sh 2>/dev/null || true
 conda activate ${CONDA_ENV} 2>/dev/null || true"
 
+    # Build the Renviron.site activation fragment (only when the env has R).
+    # Strategy: run conda activation ONCE over SSH, capture the resolved
+    # CONDA_PREFIX / CONDA_DEFAULT_ENV / PATH, and bake those literal values
+    # into ${ENV_PREFIX}/lib/R/etc/Renviron.site. R sources this file on every
+    # startup, so the kernel/console inherits the activated environment without
+    # Positron ever needing to run a wrapper. Renviron.site supports VAR=value
+    # and ${VAR} back-references but NOT command substitution, which is why PATH
+    # is resolved to a literal string here rather than written as an expression.
+    # Guarded so that with set -u an R-less env contributes an empty fragment.
+    R_ENVIRON_SETUP=""
+    if [[ "$HAS_R" -gt 0 ]]; then
+        ACTIVATED_VARS=$(ssh torch-compute "bash -lc '
+            . ${CONDA_ROOT}/etc/profile.d/conda.sh 2>/dev/null
+            conda activate ${CONDA_ENV} 2>/dev/null
+            echo \"CONDA_PREFIX=\$CONDA_PREFIX\"
+            echo \"CONDA_DEFAULT_ENV=\$CONDA_DEFAULT_ENV\"
+            echo \"PATH=\$PATH\"
+        '" 2>/dev/null)
+        CONDA_PREFIX_VAL=$(echo "$ACTIVATED_VARS" | sed -n 's/^CONDA_PREFIX=//p')
+        CONDA_ENV_VAL=$(echo "$ACTIVATED_VARS"    | sed -n 's/^CONDA_DEFAULT_ENV=//p')
+        PATH_VAL=$(echo "$ACTIVATED_VARS"         | sed -n 's/^PATH=//p')
+
+        R_ENVIRON_SETUP="R_ETC='${ENV_PREFIX}/lib/R/etc'
+mkdir -p \"\$R_ETC\"
+# Remove any prior torch-managed block, then append a fresh one (idempotent)
+sed -i '/# >>> torch-conda >>>/,/# <<< torch-conda <<</d' \"\$R_ETC/Renviron.site\" 2>/dev/null || true
+cat >> \"\$R_ETC/Renviron.site\" <<'RENVIRONEOF'
+# >>> torch-conda >>>
+CONDA_PREFIX=${CONDA_PREFIX_VAL}
+CONDA_DEFAULT_ENV=${CONDA_ENV_VAL}
+PATH=${PATH_VAL}
+# <<< torch-conda <<<
+RENVIRONEOF"
+    fi
+
     SETUP_SCRIPT=$(mktemp)
     cat > "$SETUP_SCRIPT" <<LOCALEOF
 #!/bin/bash
@@ -484,6 +524,9 @@ SETTINGSEOF
 cat > /tmp/torch-conda-init.sh <<'INITEOF'
 ${INIT_SCRIPT}
 INITEOF
+
+# Write conda env vars into Renviron.site (kernel/console activation)
+${R_ENVIRON_SETUP}
 
 # Clean up legacy blocks from previous approaches
 sed -i '/# >>> torch-conda-env >>>/,/# <<< torch-conda-env <<</d' ~/.bashrc 2>/dev/null || true
@@ -554,7 +597,7 @@ _install_cli_symlink() {
 
 _launch_vscode() {
     local uri="vscode-remote://ssh-remote+torch-compute${WORK_DIR}"
-    
+
     # Auto-install CLI symlink if app bundle exists but CLI is missing
     for bundle in \
         "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
@@ -565,7 +608,7 @@ _launch_vscode() {
             break
         fi
     done
-    
+
     local code_cli
     code_cli=$(_find_cli code \
         "/usr/local/bin/code" \
@@ -587,7 +630,7 @@ _launch_vscode() {
 
 _launch_positron() {
     local uri="vscode-remote://ssh-remote+torch-compute${WORK_DIR}"
-    
+
     # Auto-install CLI symlink if app bundle exists but CLI is missing
     for bundle in \
         "/Applications/Positron.app/Contents/Resources/app/bin/positron" \
@@ -598,7 +641,7 @@ _launch_positron() {
             break
         fi
     done
-    
+
     local positron_cli
     positron_cli=$(_find_cli positron \
         "/usr/local/bin/positron" \
